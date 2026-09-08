@@ -43,7 +43,7 @@ PROFILES: tuple[EntryProfile, ...] = (
     EntryProfile('CRYPTO_CLEAN_PATH_10X_NOSTOP',42,('TREND_CONTINUATION','EMA_PULLBACK'),False,0.18,(45,70),(30,55),'CRYPTO_TRANSFER','CRYPTO_CLEAN',('CRYPTO',),'CAPITAL_6_4_10X_NOSTOP',10.0,200.0),
 )
 
-COHORT_KEY='NO_STOP_SURVIVAL_V2'
+COHORT_KEY='EXNESS_SURVIVAL_V1'
 
 
 def _signal(market,profile,direction,score,setup,atr,bid,ask,reasons):
@@ -212,10 +212,11 @@ class Tournament:
     def store(self, profile: EntryProfile) -> CompanionStore:
         broker=exness_spec(self.market.key)
         lot_size=broker.gold_0006_equivalent_lot
+        leverage=10.0 if self.market.key=='BTC' else 1.0
         policy={
             'family':profile.family,
             'execution_model':profile.execution_model,
-            'leverage':profile.leverage,
+            'leverage':leverage,
             'paper_trade_usd':profile.paper_trade_usd if lot_size is None else None,
             'paper_lot_size':lot_size,
             'sizing_basis':'FIXED_200_USD_MARGIN' if lot_size is None else 'GOLD_0_006_LOT_NO_STOP_SURVIVAL_EQUIVALENT',
@@ -247,6 +248,8 @@ class Tournament:
     def rank(results: dict) -> list[dict]:
         rows=[]
         for key,s in results.items():
+            if s.get('last_decision')=='NOT_APPLICABLE_TO_ASSET_CLASS':
+                continue
             opened=int(s.get('opened',0)); locks=int(s.get('first_locks',0)); closed=int(s.get('closed',0))
             recent=s.get('recent',[]) or []
             realized=sum(float(r.get('capital_return_pct') or 0) for r in recent if r.get('status')=='CLOSED')

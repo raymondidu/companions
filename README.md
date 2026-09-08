@@ -18,7 +18,7 @@ Every scan evaluates three isolated families against the same forward data:
 - Gold-transfer profiles: HTF precision, EMA pullback, breakout retest, M30 local structure and M30 liquidity sweep
 - BTC-only Crypto Clean Path: identical 10x entries split between the confirmed -6% capital stop / +6% trigger / +4% first-lock policy and a no-stop challenger
 
-No-stop position sizing is calibrated for survival against the 0.006 XAUUSD reference: Silver uses the Exness minimum 0.01 lot and USOIL deliberately rounds down to 0.02 lot instead of the nearer 0.03 notional match. The BTC Clean Path lanes remain a separate experiment using $200 margin at 10x ($2,000 simulated exposure).
+No-stop position sizing is calibrated for survival against the 0.006 XAUUSD reference: Silver uses the Exness minimum 0.01 lot and USOIL deliberately rounds down to 0.02 lot instead of the nearer 0.03 notional match. Every BTC paper path uses $200 margin at 10x ($2,000 simulated exposure).
 
 The Exness public catalogue supports the configured execution symbols XAGUSD, USOIL and BTCUSD. Account-level availability is reported separately and remains unverified until the exact symbols exported from the target Exness account are supplied through `COMPANION_EXNESS_ACCOUNT_SYMBOLS`. Paper research can continue while this is unverified, but a configured missing symbol fails closed.
 

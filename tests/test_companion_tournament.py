@@ -33,10 +33,11 @@ def test_market_position_sizes_follow_execution_policy(tmp_path):
     silver=Tournament(tmp_path/'silver',MARKETS['SILVER']).store(PROFILES[0]).summary()['research_policy']
     oil=Tournament(tmp_path/'oil',MARKETS['USOIL']).store(PROFILES[0]).summary()['research_policy']
     btc=Tournament(tmp_path/'btc',MARKETS['BTC']).store(PROFILES[-1]).summary()['research_policy']
+    btc_baseline=Tournament(tmp_path/'btc-baseline',MARKETS['BTC']).store(PROFILES[0]).summary()['research_policy']
     assert silver['paper_lot_size'] == 0.01 and silver['paper_trade_usd'] is None
     assert oil['paper_lot_size'] == 0.02 and oil['paper_trade_usd'] is None
     assert btc['paper_lot_size'] is None and btc['paper_trade_usd'] == 200
-    assert btc['leverage'] == 10
+    assert btc['leverage'] == btc_baseline['leverage'] == 10
 
 
 def test_profile_candidate_is_forward_paper_only_logic():
