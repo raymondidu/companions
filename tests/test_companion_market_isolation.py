@@ -53,6 +53,22 @@ def test_paper_wallet_allows_only_one_open_position(tmp_path):
     assert s.record(sig) is None
 
 
+def test_crypto_stop_and_no_stop_lanes_are_independent(tmp_path):
+    cfg=MARKETS['BTC']
+    sig=CompanionSignal('BTC','BTCUSD','LONG',80,'TREND_CONTINUATION',100.0,1.0,'2026-01-01T00:00:00+00:00',('TEST',))
+    stopped=CompanionStore(tmp_path/'stopped.db',cfg,{'execution_model':'CAPITAL_6_4_5X_STOP6','leverage':5,'paper_capital_usd':100})
+    no_stop=CompanionStore(tmp_path/'no_stop.db',cfg,{'execution_model':'CAPITAL_6_4_5X_NOSTOP','leverage':5,'paper_capital_usd':100})
+    stopped.record(sig);no_stop.record(sig)
+    stopped.mark(98.7,98.71);no_stop.mark(98.7,98.71)
+    assert stopped.summary()['closed']==1
+    assert no_stop.summary()['open']==1
+    no_stop.mark(101.3,101.31)
+    assert no_stop.summary()['first_locks']==1
+    assert no_stop.summary()['true_confidence']==1
+    no_stop.mark(100.7,100.71)
+    assert no_stop.summary()['closed']==1
+
+
 def test_runtime_is_standalone_and_has_no_tradehouse_route():
     compose=(ROOT/'docker-compose.yml').read_text()
     runner=(ROOT/'companion_runner.py').read_text()

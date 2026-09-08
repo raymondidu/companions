@@ -12,6 +12,7 @@ Create `.env` from `.env.example` and provide:
 - `COMPANION_OANDA_ACCOUNT_ID`
 - optional exact provider-symbol overrides
 - optional `COMPANION_COINBASE_BASE_URL` for the credential-free BTC paper feed
+- optional `COMPANION_BINANCE_BASE_URL` for BTC market-breadth direction gating
 - `COMPANION_DATA_DIR=/app/companion-data`
 - `COMPANION_SCAN_INTERVAL_SECONDS=60`
 
@@ -30,6 +31,6 @@ Verify:
 - every market shows an advancing `scan_count` and a non-stale heartbeat
 
 ## Tournament rules
-Each of Silver, USOIL and BTC has five independent entry profiles: STRICT_PRECISION, BALANCED_CLEAN, TREND_ONLY, BREAKOUT_ONLY and ELITE_ONLY. Each profile receives the same forward data but owns a separate $1,000 research wallet/database. Only one position may be open per profile wallet. Policies are ATR-normalized and independent of Gold.
+Each market keeps the five baseline profiles and adds five Gold-transfer profiles: HTF precision, EMA pullback, breakout retest, M30 local structure and M30 liquidity sweep. BTC also runs two Clean Path 5x lanes with identical entries: the -6% capital stop / +6% trigger / +4% first-lock policy and a no-stop challenger. Every profile receives the same forward data but owns a separate research wallet/database. Only one position may be open per profile wallet.
 
-A profile cannot become `promotion_ready` before at least 30 forward trades, at least 80% first-lock rate and worst adverse excursion no worse than 2 ATR. `promotion_ready` is evidence only. There is no automatic live promotion.
+A profile cannot be ranked before 30 forward trades and cannot become `promotion_ready` before 200 resolved forward trades, at least 80% first-lock rate and worst adverse excursion no worse than 2 ATR. `promotion_ready` is evidence only. There is no automatic live promotion.

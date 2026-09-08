@@ -58,6 +58,19 @@ def enrich(df: pd.DataFrame) -> pd.DataFrame:
     x["range_high20"] = x["high"].rolling(20).max().shift(1)
     x["range_low20"] = x["low"].rolling(20).min().shift(1)
     x["volume_ma20"] = x["volume"].rolling(20).mean()
+    up_move = x["high"].diff()
+    down_move = -x["low"].diff()
+    plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
+    minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+    tr_sum = tr.rolling(14).sum().replace(0, float("nan"))
+    plus_di = 100 * plus_dm.rolling(14).sum() / tr_sum
+    minus_di = 100 * minus_dm.rolling(14).sum() / tr_sum
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, float("nan"))
+    x["adx14"] = dx.rolling(14).mean()
+    candle_range = (x["high"] - x["low"]).replace(0, float("nan"))
+    x["body_ratio"] = (x["close"] - x["open"]).abs() / candle_range
+    x["close_location"] = (x["close"] - x["low"]) / candle_range
+    x["momentum_3"] = 100 * (x["close"] / x["close"].shift(3) - 1)
     return x
 
 
@@ -102,9 +115,10 @@ def analyze(market: CompanionMarket, m15: pd.DataFrame, h1: pd.DataFrame, h4: pd
 
 
 class CompanionStore:
-    def __init__(self, path: str | Path, market: CompanionMarket):
+    def __init__(self, path: str | Path, market: CompanionMarket, research_policy: dict | None = None):
         self.path = str(path)
         self.market = market
+        self.research_policy = dict(research_policy or {})
         if "gold.db" in self.path.lower():
             raise ValueError("Companion markets may not use the Gold database")
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
@@ -120,6 +134,18 @@ class CompanionStore:
                 first_lock_reached INTEGER NOT NULL DEFAULT 0, lock_level_atr REAL NOT NULL DEFAULT 0,
                 exit_reason TEXT, reasons_json TEXT NOT NULL DEFAULT '[]'
             )""")
+            columns={str(r[1]) for r in c.execute("PRAGMA table_info(companion_signals)")}
+            additions={
+                'max_favorable_capital_pct': "REAL NOT NULL DEFAULT 0",
+                'max_adverse_capital_pct': "REAL NOT NULL DEFAULT 0",
+                'lock_level_capital_pct': "REAL NOT NULL DEFAULT 0",
+                'true_confidence': "INTEGER NOT NULL DEFAULT 0",
+                'execution_model': "TEXT NOT NULL DEFAULT 'ATR_LOCK_NO_HARD_STOP'",
+                'leverage': "REAL NOT NULL DEFAULT 1",
+            }
+            for name,spec in additions.items():
+                if name not in columns:
+                    c.execute(f"ALTER TABLE companion_signals ADD COLUMN {name} {spec}")
     def connect(self):
         c = sqlite3.connect(self.path, timeout=30); c.row_factory = sqlite3.Row; return c
     def has_open(self) -> bool:
@@ -130,10 +156,12 @@ class CompanionStore:
             return None
         with self.connect() as c:
             cur = c.execute("""INSERT INTO companion_signals(
-                market_key,broker_symbol,created_at,direction,score,setup,reference_price,entry_atr,opened_at,last_price,reasons_json
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""", (
+                market_key,broker_symbol,created_at,direction,score,setup,reference_price,entry_atr,opened_at,last_price,reasons_json,execution_model,leverage
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
                 sig.market_key,sig.broker_symbol,sig.created_at,sig.direction,sig.score,sig.setup,
                 sig.reference_price,sig.entry_atr,sig.created_at,sig.reference_price,json.dumps(sig.reasons),
+                str(self.research_policy.get('execution_model') or 'ATR_LOCK_NO_HARD_STOP'),
+                float(self.research_policy.get('leverage') or 1.0),
             ))
             return int(cur.lastrowid)
     def mark(self, bid: float, ask: float, high: float | None = None, low: float | None = None) -> None:
@@ -144,26 +172,48 @@ class CompanionStore:
             market=float(bid if direction=='LONG' else ask); hi=float(high if high is not None else max(bid,ask)); lo=float(low if low is not None else min(bid,ask))
             if direction=='LONG':
                 cur_atr=(market-entry)/atr; favorable=max(0.0,(hi-entry)/atr); adverse=max(0.0,(entry-lo)/atr); price_return=100*(market-entry)/entry
+                favorable_price_pct=max(0.0,100*(hi-entry)/entry); adverse_price_pct=min(0.0,100*(lo-entry)/entry)
             else:
                 cur_atr=(entry-market)/atr; favorable=max(0.0,(entry-lo)/atr); adverse=max(0.0,(hi-entry)/atr); price_return=100*(entry-market)/entry
+                favorable_price_pct=max(0.0,100*(entry-lo)/entry); adverse_price_pct=min(0.0,100*(entry-hi)/entry)
             mf=max(float(r['max_favorable_atr'] or 0),favorable); ma=max(float(r['max_adverse_atr'] or 0),adverse)
-            lock=float(r['lock_level_atr'] or 0); armed=bool(r['first_lock_reached'])
-            if mf >= self.market.first_trigger_atr:
-                stage=1+int((mf-self.market.first_trigger_atr+1e-12)//self.market.step_atr)
-                lock=max(lock,self.market.first_lock_atr+(stage-1)*self.market.step_atr); armed=True
-            should_close=armed and cur_atr <= lock
+            leverage=float(r['leverage'] or self.research_policy.get('leverage') or 1.0)
+            mf_cap=max(float(r['max_favorable_capital_pct'] or 0),favorable_price_pct*leverage)
+            ma_cap=min(float(r['max_adverse_capital_pct'] or 0),adverse_price_pct*leverage)
+            lock=float(r['lock_level_atr'] or 0); lock_cap=float(r['lock_level_capital_pct'] or 0); armed=bool(r['first_lock_reached'])
+            model=str(r['execution_model'] or 'ATR_LOCK_NO_HARD_STOP')
+            stopped=False
+            if model.startswith('CAPITAL_6_4_5X'):
+                if mf_cap >= 6.0:
+                    stage=1+int((mf_cap-6.0+1e-12)//4.0)
+                    lock_cap=max(lock_cap,4.0+(stage-1)*3.0); armed=True
+                stopped=model.endswith('STOP6') and price_return*leverage <= -6.0
+                should_close=(armed and price_return*leverage <= lock_cap) or stopped
+            else:
+                if mf >= self.market.first_trigger_atr:
+                    stage=1+int((mf-self.market.first_trigger_atr+1e-12)//self.market.step_atr)
+                    lock=max(lock,self.market.first_lock_atr+(stage-1)*self.market.step_atr); armed=True
+                should_close=armed and cur_atr <= lock
+            true_confidence=bool(r['true_confidence']) or (armed and ma_cap > -10.0)
+            exit_reason='PAPER_STOP_MINUS_6_CAPITAL' if stopped else ('PAPER_CAPITAL_PROFIT_LOCK_EXIT' if model.startswith('CAPITAL_') else 'PAPER_ATR_PROFIT_LOCK_EXIT')
             c.execute("""UPDATE companion_signals SET last_price=?,price_return_pct=?,max_favorable_atr=?,max_adverse_atr=?,first_lock_reached=?,lock_level_atr=?,status=?,closed_at=?,exit_reason=? WHERE id=?""",(
-                market,price_return,mf,ma,1 if armed else 0,lock,'CLOSED' if should_close else 'OPEN',_utcnow() if should_close else None,'PAPER_ATR_PROFIT_LOCK_EXIT' if should_close else None,r['id']))
+                market,price_return,mf,ma,1 if armed else 0,lock,'CLOSED' if should_close else 'OPEN',_utcnow() if should_close else None,exit_reason if should_close else None,r['id']))
+            c.execute("""UPDATE companion_signals SET max_favorable_capital_pct=?,max_adverse_capital_pct=?,lock_level_capital_pct=?,true_confidence=? WHERE id=?""",(
+                mf_cap,ma_cap,lock_cap,1 if true_confidence else 0,r['id']))
     def summary(self) -> dict:
         with self.connect() as c: rows=[dict(x) for x in c.execute("SELECT * FROM companion_signals ORDER BY id DESC")]
         closed=[r for r in rows if r['status']=='CLOSED']; opened=len(rows); locks=sum(bool(r['first_lock_reached']) for r in rows)
+        true_confidence=sum(bool(r.get('true_confidence')) for r in rows)
         return {
             'market': self.market.key, 'broker_symbol': self.market.broker_symbol, 'paper_only': True,
             'live_authority': False, 'tradehouse_delivery': False, 'database_path': self.path,
             'policy_state': self.market.policy_state,
             'policy': {'first_trigger_atr':self.market.first_trigger_atr,'first_lock_atr':self.market.first_lock_atr,'step_atr':self.market.step_atr},
+            'research_policy':self.research_policy,
             'opened': opened, 'open': sum(r['status']=='OPEN' for r in rows), 'closed': len(closed),
             'first_locks': locks, 'first_lock_rate_pct': round(100*locks/opened,2) if opened else 0.0,
+            'true_confidence':true_confidence,'true_confidence_rate_pct':round(100*true_confidence/opened,2) if opened else 0.0,
             'worst_adverse_atr': round(max([float(r['max_adverse_atr'] or 0) for r in rows] or [0]),2),
+            'worst_adverse_capital_pct':round(min([float(r.get('max_adverse_capital_pct') or 0) for r in rows] or [0]),2),
             'recent': rows[:20],
         }

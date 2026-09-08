@@ -10,7 +10,7 @@ from pathlib import Path
 
 from companion_markets import MARKETS
 from companion_tournament import Tournament
-from market_data import CoinbaseData, OandaData
+from market_data import BinanceBreadthData, CoinbaseData, OandaData
 
 DATA_DIR = Path(os.getenv('COMPANION_DATA_DIR', '/app/companion-data'))
 SCAN_SECONDS = max(30, int(os.getenv('COMPANION_SCAN_INTERVAL_SECONDS', '60')))
@@ -76,18 +76,28 @@ async def scan_one(key: str) -> dict:
         m15,h1,h4,q = await asyncio.gather(
             data.candles('M15',300),data.candles('H1',300),data.candles('H4',300),data.quote()
         )
+        context={}; warnings=[]
+        if key=='BTC':
+            try:
+                breadth=await BinanceBreadthData(os.getenv('COMPANION_BINANCE_BASE_URL','https://api.binance.com')).snapshot()
+                context['crypto_breadth']=breadth
+            except Exception as exc:
+                warnings.append(f'CRYPTO_BREADTH_UNAVAILABLE: {type(exc).__name__}: {exc}')
         tournament=Tournament(DATA_DIR/'tournament',cfg)
-        profiles=tournament.step(m15,h1,h4,q.bid,q.ask)
+        profiles=tournament.step(m15,h1,h4,q.bid,q.ask,context)
         ranking=tournament.rank(profiles)
-        leader=ranking[0] if ranking else None
+        leader=next((row for row in ranking if int(row.get('opened',0))>0),None)
         out.update(
             ok=True,state='RUNNING',
             quote={'bid':q.bid,'ask':q.ask,'time':q.time},
             data={'m15_candles':len(m15),'h1_candles':len(h1),'h4_candles':len(h4)},
             profiles_evaluated=len(profiles),
+            research_context=context,
+            warnings=warnings,
             profiles=profiles,ranking=ranking,leader=leader,
             promotion_policy={
-                'minimum_opened_trades':30,
+                'minimum_rank_sample':30,
+                'minimum_resolved_trades_for_promotion':200,
                 'minimum_first_lock_rate_pct':80,
                 'maximum_worst_adverse_atr':2.0,
                 'automatic_live_promotion':False,

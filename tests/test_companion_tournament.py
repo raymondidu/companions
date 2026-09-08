@@ -1,8 +1,9 @@
 import pandas as pd
 import asyncio
+import math
 from companion_markets import MARKETS
-from companion_tournament import PROFILES, Tournament, candidate_for_profile
-from market_data import Quote
+from companion_tournament import PROFILES, Tournament, candidate_for_profile, evaluate_profile
+from market_data import BinanceBreadthData, Quote
 
 
 def frame(n=100,start=100.0,step=0.3):
@@ -14,8 +15,9 @@ def frame(n=100,start=100.0,step=0.3):
 
 
 def test_tournament_has_multiple_independent_profiles():
-    assert len(PROFILES) >= 5
+    assert len(PROFILES) >= 12
     assert len({p.key for p in PROFILES}) == len(PROFILES)
+    assert {'BASELINE','GOLD_TRANSFER','CRYPTO_TRANSFER'} <= {p.family for p in PROFILES}
 
 
 def test_each_profile_gets_its_own_wallet_db(tmp_path):
@@ -39,6 +41,44 @@ def test_ranking_requires_real_sample_before_promotion():
     ranked=Tournament.rank(fake)
     assert ranked
     assert all(x['promotion_ready'] is False for x in ranked)
+
+
+def test_crypto_transfer_is_asset_class_isolated():
+    profile=next(p for p in PROFILES if p.key=='CRYPTO_CLEAN_PATH_5X_STOP6')
+    data=frame()
+    signal,reason=evaluate_profile(MARKETS['SILVER'],profile,data,data,data,129.9,130.0,{'crypto_breadth':{'long_allowed':True,'short_allowed':True}})
+    assert signal is None
+    assert reason=='NOT_APPLICABLE_TO_ASSET_CLASS'
+
+
+def test_crypto_breadth_governor_pauses_opposite_direction():
+    tickers=[]
+    for i in range(100):
+        tickers.append({'symbol':f'COIN{i}USDT','quoteVolume':str(1_000_000-i),'priceChangePercent':'3.0'})
+    tickers.extend({'symbol':s,'quoteVolume':'5000000','priceChangePercent':'4.0'} for s in BinanceBreadthData.MAJORS)
+    state=BinanceBreadthData.evaluate(tickers)
+    assert state['long_allowed'] is True
+    assert state['short_allowed'] is False
+    assert state['pressure_score'] > 0
+
+
+def test_transferred_gold_and_crypto_lanes_can_admit_clean_forward_setup():
+    def wave(step,amplitude):
+        rows=[]
+        for i in range(120):
+            close=100+i*step+math.sin(i*.9)*amplitude
+            rows.append({'time':pd.Timestamp('2026-01-01',tz='UTC')+pd.Timedelta(minutes=15*i),'open':close-.18,'high':close+.08,'low':close-.25,'close':close,'volume':100+(i%7)*5})
+        data=pd.DataFrame(rows);i=data.index[-1]
+        data.loc[i,'open']=data.loc[i,'close']-.30;data.loc[i,'low']=data.loc[i,'open']-.05;data.loc[i,'high']=data.loc[i,'close']+.04
+        return data
+    m15=wave(.03,.20);h1=wave(.10,.20);h4=wave(.18,.20);bid=float(m15.iloc[-1].close);ask=bid+.01
+    gold=next(p for p in PROFILES if p.key=='GOLD_HTF_PRECISION')
+    crypto=next(p for p in PROFILES if p.key=='CRYPTO_CLEAN_PATH_5X_STOP6')
+    gold_signal,_=evaluate_profile(MARKETS['SILVER'],gold,m15,h1,h4,bid,ask)
+    crypto_signal,_=evaluate_profile(MARKETS['BTC'],crypto,m15,h1,h4,bid,ask,{'crypto_breadth':{'state':'LONG_FAVORED','long_allowed':True,'short_allowed':False,'pressure_score':30}})
+    assert gold_signal is not None
+    assert crypto_signal is not None
+    assert gold_signal.direction==crypto_signal.direction=='LONG'
 
 
 def test_scanner_writes_running_heartbeat(tmp_path):
