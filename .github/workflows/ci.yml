@@ -1,0 +1,36 @@
+name: Companion Research Isolation
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  verify-companions:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r requirements.txt
+      - run: python -m compileall -q companion_*.py market_data.py
+      - name: Prove companion isolation and tournament contracts
+        run: |
+          python -m pytest -q \
+            tests/test_companion_market_isolation.py \
+            tests/test_companion_tournament.py
+      - name: Static live-authority guard
+        run: |
+          python - <<'PY'
+          from companion_markets import isolation_contract
+          c=isolation_contract()
+          assert c['paper_only'] is True
+          assert c['live_authority'] is False
+          assert c['tradehouse_delivery'] is False
+          assert c['shares_gold_server'] is False
+          assert c['dedicated_server_required'] is True
+          print('COMPANION_RESEARCH_ISOLATED')
+          PY
