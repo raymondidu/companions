@@ -22,7 +22,7 @@ jobs:
           port: 22
           script: |
             # Navigate to your project directory on the droplet
-            cd /home/companion
+            cd /home/companions
             
             # Fetch the latest changes
             git pull origin main
