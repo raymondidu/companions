@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from companion_markets import MARKETS
+from companion_exness_specs import CATALOG_SOURCE, CATALOG_VERIFIED_AT, validate_market_mapping
 from companion_tournament import Tournament
 from market_data import BinanceBreadthData, CoinbaseData, OandaData
 
@@ -46,6 +47,29 @@ def _provider_symbol(key: str, configured: str | None) -> str | None:
     return override or configured
 
 
+def _exness_tradability(key: str, broker_symbol: str) -> dict:
+    spec = validate_market_mapping(key, broker_symbol)
+    configured = {
+        item.strip().upper()
+        for item in os.getenv('COMPANION_EXNESS_ACCOUNT_SYMBOLS', '').split(',')
+        if item.strip()
+    }
+    account_status = 'UNVERIFIED_ON_ACCOUNT'
+    if configured:
+        account_status = 'VERIFIED_ON_ACCOUNT' if spec.broker_symbol.upper() in configured else 'NOT_ENABLED_ON_ACCOUNT'
+    return {
+        'venue': 'EXNESS',
+        'symbol': spec.broker_symbol,
+        'catalog_supported': True,
+        'catalog_source': CATALOG_SOURCE,
+        'catalog_verified_at': CATALOG_VERIFIED_AT,
+        'account_status': account_status,
+        'contract_size': spec.contract_size,
+        'minimum_lot': spec.min_lot,
+        'lot_step': spec.lot_step,
+    }
+
+
 async def scan_one(key: str) -> dict:
     started = time.monotonic()
     scan_started_at = _utcnow()
@@ -65,6 +89,10 @@ async def scan_one(key: str) -> dict:
         'deploy_sha': os.getenv('COMPANION_DEPLOY_SHA', 'UNKNOWN'),
     }
     try:
+        out['exness_tradability'] = _exness_tradability(key, cfg.broker_symbol)
+        if out['exness_tradability']['account_status'] == 'NOT_ENABLED_ON_ACCOUNT':
+            out.update(state='EXNESS_INSTRUMENT_NOT_ENABLED_ON_ACCOUNT')
+            return out
         if not cfg.enabled_for_paper:
             out.update(state='DISABLED'); return out
         if not symbol:

@@ -4,6 +4,7 @@ import pandas as pd
 
 from companion_engine import CompanionSignal, CompanionStore, analyze
 from companion_markets import MARKETS, isolation_contract
+from companion_exness_specs import validate_market_mapping
 
 ROOT=Path(__file__).resolve().parents[1]
 
@@ -29,6 +30,7 @@ def test_companion_contract_has_zero_live_authority():
     assert set(c['markets']) == {'SILVER','USOIL','BTC'}
     assert all(v.live_authority is False and v.tradehouse_delivery is False for v in MARKETS.values())
     assert MARKETS['BTC'].provider_symbol == 'BTC-USD'
+    assert {validate_market_mapping(k, v.broker_symbol).broker_symbol for k, v in MARKETS.items()} == {'XAGUSD','USOIL','BTCUSD'}
 
 
 def test_companion_store_rejects_gold_database(tmp_path):
@@ -56,17 +58,34 @@ def test_paper_wallet_allows_only_one_open_position(tmp_path):
 def test_crypto_stop_and_no_stop_lanes_are_independent(tmp_path):
     cfg=MARKETS['BTC']
     sig=CompanionSignal('BTC','BTCUSD','LONG',80,'TREND_CONTINUATION',100.0,1.0,'2026-01-01T00:00:00+00:00',('TEST',))
-    stopped=CompanionStore(tmp_path/'stopped.db',cfg,{'execution_model':'CAPITAL_6_4_5X_STOP6','leverage':5,'paper_capital_usd':100})
-    no_stop=CompanionStore(tmp_path/'no_stop.db',cfg,{'execution_model':'CAPITAL_6_4_5X_NOSTOP','leverage':5,'paper_capital_usd':100})
+    stopped=CompanionStore(tmp_path/'stopped.db',cfg,{'execution_model':'CAPITAL_6_4_10X_STOP6','leverage':10,'paper_trade_usd':200})
+    no_stop=CompanionStore(tmp_path/'no_stop.db',cfg,{'execution_model':'CAPITAL_6_4_10X_NOSTOP','leverage':10,'paper_trade_usd':200})
     stopped.record(sig);no_stop.record(sig)
-    stopped.mark(98.7,98.71);no_stop.mark(98.7,98.71)
+    stopped.mark(99.3,99.31);no_stop.mark(99.3,99.31)
     assert stopped.summary()['closed']==1
     assert no_stop.summary()['open']==1
-    no_stop.mark(101.3,101.31)
+    no_stop.mark(100.7,100.71)
     assert no_stop.summary()['first_locks']==1
     assert no_stop.summary()['true_confidence']==1
-    no_stop.mark(100.7,100.71)
+    no_stop.mark(100.3,100.31)
     assert no_stop.summary()['closed']==1
+
+
+def test_fixed_lot_pnl_and_drawdown_use_exness_contract_size(tmp_path):
+    cfg=MARKETS['SILVER']
+    policy={
+        'execution_model':'ATR_LOCK_NO_HARD_STOP','leverage':1,
+        'paper_lot_size':0.01,'starting_equity_usd':1000,'contract_size':5000,
+    }
+    store=CompanionStore(tmp_path/'silver_lot.db',cfg,policy)
+    sig=CompanionSignal('SILVER','XAGUSD','LONG',80,'TREND_CONTINUATION',30.0,0.4,'2026-01-01T00:00:00+00:00',('TEST',))
+    store.record(sig)
+    store.mark(29.0,29.01)
+    summary=store.summary(); trade=summary['recent'][0]
+    assert trade['current_pnl_usd'] == -50.0
+    assert trade['capital_return_pct'] == -5.0
+    assert summary['worst_adverse_capital_pct'] == -5.0
+    assert summary['open'] == 1
 
 
 def test_runtime_is_standalone_and_has_no_tradehouse_route():

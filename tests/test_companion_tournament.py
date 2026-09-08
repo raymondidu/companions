@@ -2,7 +2,7 @@ import pandas as pd
 import asyncio
 import math
 from companion_markets import MARKETS
-from companion_tournament import PROFILES, Tournament, candidate_for_profile, evaluate_profile
+from companion_tournament import COHORT_KEY, PROFILES, Tournament, candidate_for_profile, evaluate_profile
 from market_data import BinanceBreadthData, Quote
 
 
@@ -18,6 +18,7 @@ def test_tournament_has_multiple_independent_profiles():
     assert len(PROFILES) >= 12
     assert len({p.key for p in PROFILES}) == len(PROFILES)
     assert {'BASELINE','GOLD_TRANSFER','CRYPTO_TRANSFER'} <= {p.family for p in PROFILES}
+    assert all(p.paper_trade_usd == 200 for p in PROFILES)
 
 
 def test_each_profile_gets_its_own_wallet_db(tmp_path):
@@ -25,6 +26,17 @@ def test_each_profile_gets_its_own_wallet_db(tmp_path):
     stores=[t.store(p) for p in PROFILES]
     assert len({s.path for s in stores}) == len(PROFILES)
     assert all('gold.db' not in s.path.lower() for s in stores)
+    assert all(COHORT_KEY.lower() in s.path.lower() for s in stores)
+
+
+def test_market_position_sizes_follow_execution_policy(tmp_path):
+    silver=Tournament(tmp_path/'silver',MARKETS['SILVER']).store(PROFILES[0]).summary()['research_policy']
+    oil=Tournament(tmp_path/'oil',MARKETS['USOIL']).store(PROFILES[0]).summary()['research_policy']
+    btc=Tournament(tmp_path/'btc',MARKETS['BTC']).store(PROFILES[-1]).summary()['research_policy']
+    assert silver['paper_lot_size'] == 0.01 and silver['paper_trade_usd'] is None
+    assert oil['paper_lot_size'] == 0.02 and oil['paper_trade_usd'] is None
+    assert btc['paper_lot_size'] is None and btc['paper_trade_usd'] == 200
+    assert btc['leverage'] == 10
 
 
 def test_profile_candidate_is_forward_paper_only_logic():
@@ -44,7 +56,7 @@ def test_ranking_requires_real_sample_before_promotion():
 
 
 def test_crypto_transfer_is_asset_class_isolated():
-    profile=next(p for p in PROFILES if p.key=='CRYPTO_CLEAN_PATH_5X_STOP6')
+    profile=next(p for p in PROFILES if p.key=='CRYPTO_CLEAN_PATH_10X_STOP6')
     data=frame()
     signal,reason=evaluate_profile(MARKETS['SILVER'],profile,data,data,data,129.9,130.0,{'crypto_breadth':{'long_allowed':True,'short_allowed':True}})
     assert signal is None
@@ -73,7 +85,7 @@ def test_transferred_gold_and_crypto_lanes_can_admit_clean_forward_setup():
         return data
     m15=wave(.03,.20);h1=wave(.10,.20);h4=wave(.18,.20);bid=float(m15.iloc[-1].close);ask=bid+.01
     gold=next(p for p in PROFILES if p.key=='GOLD_HTF_PRECISION')
-    crypto=next(p for p in PROFILES if p.key=='CRYPTO_CLEAN_PATH_5X_STOP6')
+    crypto=next(p for p in PROFILES if p.key=='CRYPTO_CLEAN_PATH_10X_STOP6')
     gold_signal,_=evaluate_profile(MARKETS['SILVER'],gold,m15,h1,h4,bid,ask)
     crypto_signal,_=evaluate_profile(MARKETS['BTC'],crypto,m15,h1,h4,bid,ask,{'crypto_breadth':{'state':'LONG_FAVORED','long_allowed':True,'short_allowed':False,'pressure_score':30}})
     assert gold_signal is not None

@@ -138,10 +138,18 @@ class CompanionStore:
             additions={
                 'max_favorable_capital_pct': "REAL NOT NULL DEFAULT 0",
                 'max_adverse_capital_pct': "REAL NOT NULL DEFAULT 0",
+                'capital_return_pct': "REAL NOT NULL DEFAULT 0",
                 'lock_level_capital_pct': "REAL NOT NULL DEFAULT 0",
                 'true_confidence': "INTEGER NOT NULL DEFAULT 0",
                 'execution_model': "TEXT NOT NULL DEFAULT 'ATR_LOCK_NO_HARD_STOP'",
                 'leverage': "REAL NOT NULL DEFAULT 1",
+                'paper_lot_size': "REAL",
+                'paper_trade_usd': "REAL",
+                'starting_equity_usd': "REAL NOT NULL DEFAULT 1000",
+                'contract_size': "REAL",
+                'current_pnl_usd': "REAL NOT NULL DEFAULT 0",
+                'max_favorable_pnl_usd': "REAL NOT NULL DEFAULT 0",
+                'max_adverse_pnl_usd': "REAL NOT NULL DEFAULT 0",
             }
             for name,spec in additions.items():
                 if name not in columns:
@@ -156,12 +164,17 @@ class CompanionStore:
             return None
         with self.connect() as c:
             cur = c.execute("""INSERT INTO companion_signals(
-                market_key,broker_symbol,created_at,direction,score,setup,reference_price,entry_atr,opened_at,last_price,reasons_json,execution_model,leverage
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
+                market_key,broker_symbol,created_at,direction,score,setup,reference_price,entry_atr,opened_at,last_price,reasons_json,execution_model,leverage,
+                paper_lot_size,paper_trade_usd,starting_equity_usd,contract_size
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
                 sig.market_key,sig.broker_symbol,sig.created_at,sig.direction,sig.score,sig.setup,
                 sig.reference_price,sig.entry_atr,sig.created_at,sig.reference_price,json.dumps(sig.reasons),
                 str(self.research_policy.get('execution_model') or 'ATR_LOCK_NO_HARD_STOP'),
                 float(self.research_policy.get('leverage') or 1.0),
+                self.research_policy.get('paper_lot_size'),
+                self.research_policy.get('paper_trade_usd'),
+                float(self.research_policy.get('starting_equity_usd') or self.market.starting_equity_usd),
+                self.research_policy.get('contract_size'),
             ))
             return int(cur.lastrowid)
     def mark(self, bid: float, ask: float, high: float | None = None, low: float | None = None) -> None:
@@ -178,17 +191,34 @@ class CompanionStore:
                 favorable_price_pct=max(0.0,100*(entry-lo)/entry); adverse_price_pct=min(0.0,100*(entry-hi)/entry)
             mf=max(float(r['max_favorable_atr'] or 0),favorable); ma=max(float(r['max_adverse_atr'] or 0),adverse)
             leverage=float(r['leverage'] or self.research_policy.get('leverage') or 1.0)
-            mf_cap=max(float(r['max_favorable_capital_pct'] or 0),favorable_price_pct*leverage)
-            ma_cap=min(float(r['max_adverse_capital_pct'] or 0),adverse_price_pct*leverage)
+            lot=float(r.get('paper_lot_size') or self.research_policy.get('paper_lot_size') or 0)
+            contract=float(r.get('contract_size') or self.research_policy.get('contract_size') or 0)
+            equity=max(float(r.get('starting_equity_usd') or self.research_policy.get('starting_equity_usd') or self.market.starting_equity_usd),1e-9)
+            allocation=max(float(r.get('paper_trade_usd') or self.research_policy.get('paper_trade_usd') or equity),1e-9)
+            if lot>0 and contract>0:
+                if direction=='LONG':
+                    current_pnl=(market-entry)*contract*lot; favorable_pnl=max(0.0,(hi-entry)*contract*lot); adverse_pnl=min(0.0,(lo-entry)*contract*lot)
+                else:
+                    current_pnl=(entry-market)*contract*lot; favorable_pnl=max(0.0,(entry-lo)*contract*lot); adverse_pnl=min(0.0,(entry-hi)*contract*lot)
+                capital_return=100*current_pnl/equity
+                mf_pnl=max(float(r.get('max_favorable_pnl_usd') or 0),favorable_pnl)
+                ma_pnl=min(float(r.get('max_adverse_pnl_usd') or 0),adverse_pnl)
+                mf_cap=100*mf_pnl/equity; ma_cap=100*ma_pnl/equity
+            else:
+                capital_return=price_return*leverage
+                current_pnl=allocation*capital_return/100
+                mf_cap=max(float(r['max_favorable_capital_pct'] or 0),favorable_price_pct*leverage)
+                ma_cap=min(float(r['max_adverse_capital_pct'] or 0),adverse_price_pct*leverage)
+                mf_pnl=allocation*mf_cap/100; ma_pnl=allocation*ma_cap/100
             lock=float(r['lock_level_atr'] or 0); lock_cap=float(r['lock_level_capital_pct'] or 0); armed=bool(r['first_lock_reached'])
             model=str(r['execution_model'] or 'ATR_LOCK_NO_HARD_STOP')
             stopped=False
-            if model.startswith('CAPITAL_6_4_5X'):
+            if model.startswith('CAPITAL_6_4_'):
                 if mf_cap >= 6.0:
                     stage=1+int((mf_cap-6.0+1e-12)//4.0)
                     lock_cap=max(lock_cap,4.0+(stage-1)*3.0); armed=True
-                stopped=model.endswith('STOP6') and price_return*leverage <= -6.0
-                should_close=(armed and price_return*leverage <= lock_cap) or stopped
+                stopped=model.endswith('STOP6') and capital_return <= -6.0
+                should_close=(armed and capital_return <= lock_cap) or stopped
             else:
                 if mf >= self.market.first_trigger_atr:
                     stage=1+int((mf-self.market.first_trigger_atr+1e-12)//self.market.step_atr)
@@ -198,8 +228,8 @@ class CompanionStore:
             exit_reason='PAPER_STOP_MINUS_6_CAPITAL' if stopped else ('PAPER_CAPITAL_PROFIT_LOCK_EXIT' if model.startswith('CAPITAL_') else 'PAPER_ATR_PROFIT_LOCK_EXIT')
             c.execute("""UPDATE companion_signals SET last_price=?,price_return_pct=?,max_favorable_atr=?,max_adverse_atr=?,first_lock_reached=?,lock_level_atr=?,status=?,closed_at=?,exit_reason=? WHERE id=?""",(
                 market,price_return,mf,ma,1 if armed else 0,lock,'CLOSED' if should_close else 'OPEN',_utcnow() if should_close else None,exit_reason if should_close else None,r['id']))
-            c.execute("""UPDATE companion_signals SET max_favorable_capital_pct=?,max_adverse_capital_pct=?,lock_level_capital_pct=?,true_confidence=? WHERE id=?""",(
-                mf_cap,ma_cap,lock_cap,1 if true_confidence else 0,r['id']))
+            c.execute("""UPDATE companion_signals SET capital_return_pct=?,max_favorable_capital_pct=?,max_adverse_capital_pct=?,lock_level_capital_pct=?,true_confidence=?,current_pnl_usd=?,max_favorable_pnl_usd=?,max_adverse_pnl_usd=? WHERE id=?""",(
+                capital_return,mf_cap,ma_cap,lock_cap,1 if true_confidence else 0,current_pnl,mf_pnl,ma_pnl,r['id']))
     def summary(self) -> dict:
         with self.connect() as c: rows=[dict(x) for x in c.execute("SELECT * FROM companion_signals ORDER BY id DESC")]
         closed=[r for r in rows if r['status']=='CLOSED']; opened=len(rows); locks=sum(bool(r['first_lock_reached']) for r in rows)
@@ -215,5 +245,7 @@ class CompanionStore:
             'true_confidence':true_confidence,'true_confidence_rate_pct':round(100*true_confidence/opened,2) if opened else 0.0,
             'worst_adverse_atr': round(max([float(r['max_adverse_atr'] or 0) for r in rows] or [0]),2),
             'worst_adverse_capital_pct':round(min([float(r.get('max_adverse_capital_pct') or 0) for r in rows] or [0]),2),
+            'realized_pnl_usd':round(sum(float(r.get('current_pnl_usd') or 0) for r in closed),2),
+            'open_pnl_usd':round(sum(float(r.get('current_pnl_usd') or 0) for r in rows if r['status']=='OPEN'),2),
             'recent': rows[:20],
         }

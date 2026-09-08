@@ -7,6 +7,7 @@ from pathlib import Path
 import pandas as pd
 
 from companion_engine import CompanionSignal, CompanionStore, enrich
+from companion_exness_specs import spec as exness_spec
 from companion_markets import CompanionMarket
 
 
@@ -24,7 +25,7 @@ class EntryProfile:
     asset_classes: tuple[str, ...] = ()
     execution_model: str = 'ATR_LOCK_NO_HARD_STOP'
     leverage: float = 1.0
-    paper_capital_usd: float = 1000.0
+    paper_trade_usd: float = 200.0
 
 
 PROFILES: tuple[EntryProfile, ...] = (
@@ -38,9 +39,11 @@ PROFILES: tuple[EntryProfile, ...] = (
     EntryProfile('GOLD_BREAKOUT_RETEST',80,('BREAKOUT_RETEST',),False,0.14,(48,76),(24,52),'GOLD_TRANSFER','GOLD_RETEST'),
     EntryProfile('GOLD_M30_LOCAL_STRUCTURE',76,('M30_LOCAL_STRUCTURE',),False,0.16,(45,78),(22,55),'GOLD_TRANSFER','M30_STRUCTURE'),
     EntryProfile('GOLD_M30_LIQUIDITY_SWEEP',78,('M30_LIQUIDITY_SWEEP',),False,0.16,(42,75),(25,58),'GOLD_TRANSFER','M30_SWEEP'),
-    EntryProfile('CRYPTO_CLEAN_PATH_5X_STOP6',42,('TREND_CONTINUATION','EMA_PULLBACK'),False,0.18,(45,70),(30,55),'CRYPTO_TRANSFER','CRYPTO_CLEAN',('CRYPTO',),'CAPITAL_6_4_5X_STOP6',5.0,100.0),
-    EntryProfile('CRYPTO_CLEAN_PATH_5X_NOSTOP',42,('TREND_CONTINUATION','EMA_PULLBACK'),False,0.18,(45,70),(30,55),'CRYPTO_TRANSFER','CRYPTO_CLEAN',('CRYPTO',),'CAPITAL_6_4_5X_NOSTOP',5.0,100.0),
+    EntryProfile('CRYPTO_CLEAN_PATH_10X_STOP6',42,('TREND_CONTINUATION','EMA_PULLBACK'),False,0.18,(45,70),(30,55),'CRYPTO_TRANSFER','CRYPTO_CLEAN',('CRYPTO',),'CAPITAL_6_4_10X_STOP6',10.0,200.0),
+    EntryProfile('CRYPTO_CLEAN_PATH_10X_NOSTOP',42,('TREND_CONTINUATION','EMA_PULLBACK'),False,0.18,(45,70),(30,55),'CRYPTO_TRANSFER','CRYPTO_CLEAN',('CRYPTO',),'CAPITAL_6_4_10X_NOSTOP',10.0,200.0),
 )
+
+COHORT_KEY='NO_STOP_SURVIVAL_V2'
 
 
 def _signal(market,profile,direction,score,setup,atr,bid,ask,reasons):
@@ -207,8 +210,20 @@ class Tournament:
         self.base_dir.mkdir(parents=True,exist_ok=True)
 
     def store(self, profile: EntryProfile) -> CompanionStore:
-        policy={'family':profile.family,'execution_model':profile.execution_model,'leverage':profile.leverage,'paper_capital_usd':profile.paper_capital_usd}
-        return CompanionStore(self.base_dir/f'{self.market.key.lower()}__{profile.key.lower()}.db',self.market,policy)
+        broker=exness_spec(self.market.key)
+        lot_size=broker.gold_0006_equivalent_lot
+        policy={
+            'family':profile.family,
+            'execution_model':profile.execution_model,
+            'leverage':profile.leverage,
+            'paper_trade_usd':profile.paper_trade_usd if lot_size is None else None,
+            'paper_lot_size':lot_size,
+            'sizing_basis':'FIXED_200_USD_MARGIN' if lot_size is None else 'GOLD_0_006_LOT_NO_STOP_SURVIVAL_EQUIVALENT',
+            'starting_equity_usd':self.market.starting_equity_usd,
+            'contract_size':broker.contract_size,
+            'cohort':COHORT_KEY,
+        }
+        return CompanionStore(self.base_dir/f'{self.market.key.lower()}__{profile.key.lower()}__{COHORT_KEY.lower()}.db',self.market,policy)
 
     def step(self, m15: pd.DataFrame, h1: pd.DataFrame, h4: pd.DataFrame, bid: float, ask: float, context: dict | None = None) -> dict:
         out={}
@@ -234,11 +249,12 @@ class Tournament:
         for key,s in results.items():
             opened=int(s.get('opened',0)); locks=int(s.get('first_locks',0)); closed=int(s.get('closed',0))
             recent=s.get('recent',[]) or []
-            realized=sum(float(r.get('price_return_pct') or 0) for r in recent if r.get('status')=='CLOSED')
+            realized=sum(float(r.get('capital_return_pct') or 0) for r in recent if r.get('status')=='CLOSED')
+            realized_pnl=sum(float(r.get('current_pnl_usd') or 0) for r in recent if r.get('status')=='CLOSED')
             worst=float(s.get('worst_adverse_atr') or 0)
             lock_rate=(100*locks/opened) if opened else 0.0
             evidence=min(opened,30)/30.0
             quality=(lock_rate*0.55)+(max(-50.0,min(50.0,realized))*0.25)-(worst*8.0)+(closed*0.20)
             policy=s.get('research_policy') or {}
-            rows.append({'profile':key,'family':s.get('family'),'execution_model':policy.get('execution_model'),'paper_capital_usd':policy.get('paper_capital_usd'),'leverage':policy.get('leverage'),'last_decision':s.get('last_decision'),'opened':opened,'closed':closed,'first_locks':locks,'first_lock_rate_pct':round(lock_rate,2),'true_confidence_rate_pct':s.get('true_confidence_rate_pct',0),'realized_price_return_sum_pct':round(realized,4),'worst_adverse_atr':round(worst,3),'worst_adverse_capital_pct':s.get('worst_adverse_capital_pct',0),'evidence_weight':round(evidence,3),'research_score':round(quality*evidence,3),'promotion_ready': closed>=200 and lock_rate>=80 and worst<=2.0})
+            rows.append({'profile':key,'family':s.get('family'),'execution_model':policy.get('execution_model'),'paper_trade_usd':policy.get('paper_trade_usd'),'paper_lot_size':policy.get('paper_lot_size'),'sizing_basis':policy.get('sizing_basis'),'starting_equity_usd':policy.get('starting_equity_usd'),'cohort':policy.get('cohort'),'leverage':policy.get('leverage'),'last_decision':s.get('last_decision'),'opened':opened,'closed':closed,'open_pnl_usd':s.get('open_pnl_usd',0),'realized_pnl_usd':round(realized_pnl,2),'first_locks':locks,'first_lock_rate_pct':round(lock_rate,2),'true_confidence_rate_pct':s.get('true_confidence_rate_pct',0),'realized_capital_return_sum_pct':round(realized,4),'worst_adverse_atr':round(worst,3),'worst_adverse_capital_pct':s.get('worst_adverse_capital_pct',0),'evidence_weight':round(evidence,3),'research_score':round(quality*evidence,3),'promotion_ready': closed>=200 and lock_rate>=80 and worst<=2.0})
         return sorted(rows,key=lambda x:(x['promotion_ready'],x['research_score'],x['first_lock_rate_pct']),reverse=True)
