@@ -26,7 +26,10 @@ jobs:
             
             # Fetch the latest changes
             git pull origin main
+
+            # Expose the exact deployed source revision in scanner telemetry.
+            export COMPANION_DEPLOY_SHA=$(git rev-parse HEAD)
             
-            # (Optional) build dependencies and restart services
+            # Build and restart both isolated companion services.
             docker compose up -d --build 
            

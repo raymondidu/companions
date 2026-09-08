@@ -4,14 +4,41 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from companion_markets import MARKETS
 from companion_tournament import Tournament
-from market_data import OandaData
+from market_data import CoinbaseData, OandaData
 
 DATA_DIR = Path(os.getenv('COMPANION_DATA_DIR', '/app/companion-data'))
 SCAN_SECONDS = max(30, int(os.getenv('COMPANION_SCAN_INTERVAL_SECONDS', '60')))
+STARTED_AT = datetime.now(timezone.utc).isoformat()
+SCAN_COUNTS = {key: 0 for key in MARKETS}
+
+
+def _utcnow() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _write_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + '.tmp')
+    temporary.write_text(json.dumps(payload, sort_keys=True, default=str))
+    temporary.replace(path)
+
+
+def _provider(key: str, symbol: str):
+    if key == 'BTC':
+        base = os.getenv('COMPANION_COINBASE_BASE_URL', 'https://api.exchange.coinbase.com').strip()
+        return CoinbaseData(base, symbol), 'COINBASE_PUBLIC'
+    base = os.getenv('COMPANION_OANDA_BASE_URL', '').strip()
+    token = os.getenv('COMPANION_OANDA_TOKEN', '').strip()
+    account = os.getenv('COMPANION_OANDA_ACCOUNT_ID', '').strip()
+    if not (base and token and account):
+        return None, 'OANDA_CREDENTIALS_MISSING'
+    return OandaData(base, token, account, symbol), 'OANDA'
 
 
 def _provider_symbol(key: str, configured: str | None) -> str | None:
@@ -20,6 +47,9 @@ def _provider_symbol(key: str, configured: str | None) -> str | None:
 
 
 async def scan_one(key: str) -> dict:
+    started = time.monotonic()
+    scan_started_at = _utcnow()
+    SCAN_COUNTS[key] += 1
     cfg = MARKETS[key]
     symbol = _provider_symbol(key, cfg.provider_symbol)
     status_path = DATA_DIR / f'{key.lower()}_status.json'
@@ -28,18 +58,21 @@ async def scan_one(key: str) -> dict:
         'live_authority': False, 'tradehouse_delivery': False,
         'provider_symbol': symbol, 'ok': False,
         'forward_only': True, 'tournament': True,
+        'scanner_started_at': STARTED_AT,
+        'last_scan_started_at': scan_started_at,
+        'scan_count': SCAN_COUNTS[key],
+        'scan_interval_seconds': SCAN_SECONDS,
+        'deploy_sha': os.getenv('COMPANION_DEPLOY_SHA', 'UNKNOWN'),
     }
     try:
         if not cfg.enabled_for_paper:
             out.update(state='DISABLED'); return out
         if not symbol:
             out.update(state='DATA_PROVIDER_UNCONFIGURED'); return out
-        base=os.getenv('COMPANION_OANDA_BASE_URL','').strip()
-        token=os.getenv('COMPANION_OANDA_TOKEN','').strip()
-        account=os.getenv('COMPANION_OANDA_ACCOUNT_ID','').strip()
-        if not (base and token and account):
+        data, provider_name = _provider(key, symbol)
+        out['provider'] = provider_name
+        if data is None:
             out.update(state='COMPANION_DATA_PROVIDER_CREDENTIALS_MISSING'); return out
-        data=OandaData(base,token,account,symbol)
         m15,h1,h4,q = await asyncio.gather(
             data.candles('M15',300),data.candles('H1',300),data.candles('H4',300),data.quote()
         )
@@ -50,6 +83,8 @@ async def scan_one(key: str) -> dict:
         out.update(
             ok=True,state='RUNNING',
             quote={'bid':q.bid,'ask':q.ask,'time':q.time},
+            data={'m15_candles':len(m15),'h1_candles':len(h1),'h4_candles':len(h4)},
+            profiles_evaluated=len(profiles),
             profiles=profiles,ranking=ranking,leader=leader,
             promotion_policy={
                 'minimum_opened_trades':30,
@@ -62,13 +97,23 @@ async def scan_one(key: str) -> dict:
     except Exception as exc:
         out.update(state='ERROR',error=f'{type(exc).__name__}: {exc}')
     finally:
-        DATA_DIR.mkdir(parents=True,exist_ok=True)
-        status_path.write_text(json.dumps(out,sort_keys=True,default=str))
+        out['last_scan_completed_at'] = _utcnow()
+        out['scan_duration_ms'] = round((time.monotonic() - started) * 1000, 1)
+        _write_json(status_path, out)
     return out
 
 
 async def run_forever() -> None:
     DATA_DIR.mkdir(parents=True,exist_ok=True)
+    for key, cfg in MARKETS.items():
+        _write_json(DATA_DIR/f'{key.lower()}_status.json', {
+            'market': key, 'broker_symbol': cfg.broker_symbol,
+            'state': 'STARTING', 'ok': False, 'paper_only': True,
+            'live_authority': False, 'tradehouse_delivery': False,
+            'scanner_started_at': STARTED_AT, 'scan_count': 0,
+            'scan_interval_seconds': SCAN_SECONDS,
+            'deploy_sha': os.getenv('COMPANION_DEPLOY_SHA', 'UNKNOWN'),
+        })
     while True:
         await asyncio.gather(*(scan_one(k) for k in MARKETS))
         await asyncio.sleep(SCAN_SECONDS)

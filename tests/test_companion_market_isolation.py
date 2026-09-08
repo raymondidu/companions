@@ -28,6 +28,7 @@ def test_companion_contract_has_zero_live_authority():
     assert c['copies_gold_thresholds'] is False
     assert set(c['markets']) == {'SILVER','USOIL','BTC'}
     assert all(v.live_authority is False and v.tradehouse_delivery is False for v in MARKETS.values())
+    assert MARKETS['BTC'].provider_symbol == 'BTC-USD'
 
 
 def test_companion_store_rejects_gold_database(tmp_path):
@@ -60,3 +61,11 @@ def test_runtime_is_standalone_and_has_no_tradehouse_route():
     assert 'COMPANION_OANDA_TOKEN' in runner
     assert '/api/executor/' not in runner
     assert "'tradehouse_delivery': False" in runner
+
+
+def test_container_repairs_only_the_dedicated_companion_volume():
+    dockerfile=(ROOT/'Dockerfile').read_text()
+    entrypoint=(ROOT/'docker-entrypoint.sh').read_text()
+    assert 'ENTRYPOINT ["/app/docker-entrypoint.sh"]' in dockerfile
+    assert 'chown -R appuser:appuser /app/companion-data' in entrypoint
+    assert 'gold' not in entrypoint.lower()

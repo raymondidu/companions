@@ -11,6 +11,7 @@ services:
     environment:
       COMPANION_DATA_DIR: /app/companion-data
       COMPANION_SCAN_INTERVAL_SECONDS: "60"
+      COMPANION_DEPLOY_SHA: ${COMPANION_DEPLOY_SHA:-UNKNOWN}
     command: python companion_runner.py
     volumes: [companion-data:/app/companion-data]
 
@@ -22,6 +23,8 @@ services:
         required: false
     environment:
       COMPANION_DATA_DIR: /app/companion-data
+      COMPANION_SCAN_INTERVAL_SECONDS: "60"
+      COMPANION_DEPLOY_SHA: ${COMPANION_DEPLOY_SHA:-UNKNOWN}
     command: uvicorn companion_app:app --host 0.0.0.0 --port 8082
     ports: ["8082:8082"]
     volumes: [companion-data:/app/companion-data]

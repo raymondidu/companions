@@ -41,7 +41,7 @@ MARKETS: dict[str, CompanionMarket] = {
     ),
     "BTC": CompanionMarket(
         key="BTC", display_name="BTC Weekend Lab", broker_symbol="BTCUSD",
-        provider_symbol=None, asset_class="CRYPTO", enabled_for_paper=True,
+        provider_symbol="BTC-USD", asset_class="CRYPTO", enabled_for_paper=True,
         liquidity_approved=True,
         liquidity_basis="Bitcoin has persistent 24/7 spot and derivatives liquidity",
         first_trigger_atr=1.80, first_lock_atr=0.90, step_atr=0.75,

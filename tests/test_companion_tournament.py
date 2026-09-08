@@ -1,6 +1,8 @@
 import pandas as pd
+import asyncio
 from companion_markets import MARKETS
 from companion_tournament import PROFILES, Tournament, candidate_for_profile
+from market_data import Quote
 
 
 def frame(n=100,start=100.0,step=0.3):
@@ -37,3 +39,30 @@ def test_ranking_requires_real_sample_before_promotion():
     ranked=Tournament.rank(fake)
     assert ranked
     assert all(x['promotion_ready'] is False for x in ranked)
+
+
+def test_scanner_writes_running_heartbeat(tmp_path):
+    import companion_runner
+
+    class FakeData:
+        async def candles(self, granularity, count):
+            steps={'M15':.3,'H1':.5,'H4':1.0}
+            return frame(100,step=steps[granularity])
+        async def quote(self):
+            return Quote(130.0,130.01,'2026-01-02T00:00:00+00:00')
+
+    original_dir=companion_runner.DATA_DIR
+    original_provider=companion_runner._provider
+    try:
+        companion_runner.DATA_DIR=tmp_path
+        companion_runner._provider=lambda key,symbol:(FakeData(),'TEST_PROVIDER')
+        result=asyncio.run(companion_runner.scan_one('SILVER'))
+    finally:
+        companion_runner.DATA_DIR=original_dir
+        companion_runner._provider=original_provider
+    assert result['state']=='RUNNING'
+    assert result['ok'] is True
+    assert result['profiles_evaluated']==len(PROFILES)
+    assert result['scan_count'] >= 1
+    assert result['last_scan_completed_at']
+    assert (tmp_path/'silver_status.json').exists()
