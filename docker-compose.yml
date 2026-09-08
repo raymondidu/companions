@@ -1,0 +1,32 @@
+name: companions
+
+services:
+  companion-scanner:
+    image: companions-app
+    build: .
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      COMPANION_DATA_DIR: /app/companion-data
+      COMPANION_SCAN_INTERVAL_SECONDS: "60"
+    command: python companion_runner.py
+    volumes: [companion-data:/app/companion-data]
+
+  companion-dashboard:
+    image: companions-app
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      COMPANION_DATA_DIR: /app/companion-data
+    command: uvicorn companion_app:app --host 0.0.0.0 --port 8082
+    ports: ["8082:8082"]
+    volumes: [companion-data:/app/companion-data]
+
+volumes:
+  companion-data:
+
+# Paper-only isolation: no Gold volume, no Gold runtime, no TradeHouse route.
