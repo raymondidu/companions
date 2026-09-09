@@ -21,15 +21,18 @@ jobs:
           key: ${{ secrets.DO_SSH_KEY }}
           port: 22
           script: |
-            # Navigate to your project directory on the droplet
+            set -e
             cd /home/companions
-            
-            # Fetch the latest changes
-            git pull origin main
 
-            # Expose the exact deployed source revision in scanner telemetry.
+            git pull origin main
             export COMPANION_DEPLOY_SHA=$(git rev-parse HEAD)
-            
-            # Build and restart both isolated companion services.
-            docker compose up -d --build 
-           
+
+            # Clean stale Compose containers from interrupted/recreate runs.
+            docker compose down --remove-orphans || true
+            docker rm -f companions-companion-scanner-1 companions-companion-dashboard-1 2>/dev/null || true
+
+            # Rebuild and start the isolated Companion services.
+            docker compose up -d --build
+
+            # Fail the deployment if either service is not running.
+            docker compose ps
