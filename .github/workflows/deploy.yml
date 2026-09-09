@@ -15,11 +15,15 @@ jobs:
 
       - name: Deploy via SSH
         uses: appleboy/ssh-action@v1.2.0
+        env:
+          COMPANION_EXECUTOR_SECRET: ${{ secrets.COMPANION_EXECUTOR_SECRET || secrets.TRADEHOUSE_EXECUTOR_SECRET || secrets.GOLD_EXECUTOR_SECRET || secrets.EXECUTOR_SECRET }}
+          COMPANION_CALLBACK_SECRET: ${{ secrets.COMPANION_CALLBACK_SECRET || secrets.EXECUTOR_CALLBACK_SECRET }}
         with:
           host: ${{ secrets.DO_HOST }}
           username: ${{ secrets.DO_USER }}
           key: ${{ secrets.DO_SSH_KEY }}
           port: 22
+          envs: COMPANION_EXECUTOR_SECRET,COMPANION_CALLBACK_SECRET
           script: |
             set -euo pipefail
             cd /home/companions
@@ -32,14 +36,26 @@ jobs:
             chmod 600 "$COMPANION_ENV"
 
             tmp="$(mktemp)"
-            grep -vE '^(COMPANION_EXECUTOR_BASE_URL|COMPANION_TRADEHOUSE_PILOT_ENABLED)=' "$COMPANION_ENV" > "$tmp" || true
+            grep -vE '^(COMPANION_EXECUTOR_BASE_URL|COMPANION_TRADEHOUSE_PILOT_ENABLED|COMPANION_EXECUTOR_SECRET|COMPANION_CALLBACK_SECRET|COMPANION_CALLBACK_HMAC_SECRET)=' "$COMPANION_ENV" > "$tmp" || true
             cat "$tmp" > "$COMPANION_ENV"
             rm -f "$tmp"
+
             printf '%s\n' 'COMPANION_EXECUTOR_BASE_URL=https://tradehouse.app' >> "$COMPANION_ENV"
             printf '%s\n' 'COMPANION_TRADEHOUSE_PILOT_ENABLED=true' >> "$COMPANION_ENV"
 
+            if [ -n "${COMPANION_EXECUTOR_SECRET:-}" ]; then
+              printf 'COMPANION_EXECUTOR_SECRET=%s\n' "$COMPANION_EXECUTOR_SECRET" >> "$COMPANION_ENV"
+            fi
+            if [ -n "${COMPANION_CALLBACK_SECRET:-}" ]; then
+              printf 'COMPANION_CALLBACK_SECRET=%s\n' "$COMPANION_CALLBACK_SECRET" >> "$COMPANION_ENV"
+            fi
+
             if ! grep -qE '^COMPANION_EXECUTOR_SECRET=.+$' "$COMPANION_ENV" 2>/dev/null; then
-              echo 'Companion TradeHouse credential is unavailable on /home/companions/.env; refusing an unconfigured deployment.' >&2
+              echo 'Companion TradeHouse ingest credential is unavailable; refusing an unconfigured deployment.' >&2
+              exit 1
+            fi
+            if ! grep -qE '^COMPANION_CALLBACK_SECRET=.+$' "$COMPANION_ENV" 2>/dev/null; then
+              echo 'Companion callback credential is unavailable; refusing a deployment that cannot verify TradeHouse lifecycle callbacks.' >&2
               exit 1
             fi
 
@@ -57,4 +73,4 @@ jobs:
               sleep 3
             done
             printf '%s' "$HEALTH" | python3 -c 'import json,sys; d=json.load(sys.stdin); t=d.get("tradehouse") or {}; assert t.get("executor_configured") is True,d; assert t.get("live_enable_requested") is True,d'
-            echo 'Companion deployment verified: TradeHouse transport configured and pilot enabled.'
+            echo 'Companion deployment verified: TradeHouse transport configured, callback auth present, and pilot enabled.'
