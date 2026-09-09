@@ -10,8 +10,8 @@ from pathlib import Path
 
 from companion_markets import MARKETS
 from companion_exness_specs import CATALOG_SOURCE, CATALOG_VERIFIED_AT, validate_market_mapping
-from companion_tournament import PROFILES, Tournament
-from companion_tradehouse import deliver_selected_signal
+from companion_tournament import PROFILES, Tournament, evaluate_profile
+from companion_tradehouse import ACTIVE_PATHS, deliver_selected_signal
 from market_data import BinanceBreadthData, CoinbaseData, OandaData
 
 DATA_DIR = Path(os.getenv('COMPANION_DATA_DIR', '/app/companion-data'))
@@ -72,6 +72,20 @@ def _exness_tradability(key: str, broker_symbol: str) -> dict:
     }
 
 
+def _live_profile(key: str):
+    wanted = ACTIVE_PATHS.get(key)
+    if not wanted:
+        return None
+    return next((p for p in PROFILES if p.key == wanted), None)
+
+
+def _setup_key(m15) -> str:
+    if m15 is None or len(m15) == 0:
+        return 'UNKNOWN_SETUP'
+    raw = m15.iloc[-1].get('time')
+    return str(raw)
+
+
 async def scan_one(key: str) -> dict:
     started = time.monotonic()
     scan_started_at = _utcnow()
@@ -116,11 +130,23 @@ async def scan_one(key: str) -> dict:
                 context['crypto_breadth']=breadth
             except Exception as exc:
                 warnings.append(f'CRYPTO_BREADTH_UNAVAILABLE: {type(exc).__name__}: {exc}')
+
         tournament=Tournament(DATA_DIR/'tournament',cfg)
         profiles=tournament.step(m15,h1,h4,q.bid,q.ask,context)
         ranking=tournament.rank(profiles)
         leader=next((row for row in ranking if row.get('rank_eligible')),None)
-        delivery=await deliver_selected_signal(key,profiles)
+
+        live_candidate=None
+        live_gate='REFUSED_INSTRUMENT'
+        live_profile=_live_profile(key)
+        if live_profile is not None:
+            candidate,live_gate=evaluate_profile(cfg,live_profile,m15,h1,h4,q.bid,q.ask,context)
+            live_candidate=vars(candidate) if candidate is not None else None
+        delivery=await deliver_selected_signal(
+            key, profiles, live_candidate=live_candidate,
+            setup_key=_setup_key(m15), live_gate=live_gate,
+        )
+
         out.update(
             ok=True,state='RUNNING',
             quote={'bid':q.bid,'ask':q.ask,'time':q.time},
@@ -129,6 +155,8 @@ async def scan_one(key: str) -> dict:
             research_context=context,
             warnings=warnings,
             profiles=profiles,ranking=ranking,leader=leader,
+            live_signal_candidate=live_candidate,
+            live_signal_gate=live_gate,
             tradehouse_delivery=delivery,
             promotion_policy={
                 'minimum_rank_sample':30,
