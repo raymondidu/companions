@@ -12,6 +12,10 @@ services:
       COMPANION_DATA_DIR: /app/companion-data
       COMPANION_SCAN_INTERVAL_SECONDS: "60"
       COMPANION_DEPLOY_SHA: ${COMPANION_DEPLOY_SHA:-UNKNOWN}
+      # Companion supplies only direction + fresh market reference price.
+      # TradeHouse owns user capital, sizing, leverage and execution.
+      COMPANION_EXECUTOR_BASE_URL: ${COMPANION_EXECUTOR_BASE_URL:-https://tradehouse.app}
+      COMPANION_TRADEHOUSE_PILOT_ENABLED: ${COMPANION_TRADEHOUSE_PILOT_ENABLED:-true}
     command: python companion_runner.py
     volumes: [companion-data:/app/companion-data]
 
@@ -25,6 +29,8 @@ services:
       COMPANION_DATA_DIR: /app/companion-data
       COMPANION_SCAN_INTERVAL_SECONDS: "60"
       COMPANION_DEPLOY_SHA: ${COMPANION_DEPLOY_SHA:-UNKNOWN}
+      COMPANION_EXECUTOR_BASE_URL: ${COMPANION_EXECUTOR_BASE_URL:-https://tradehouse.app}
+      COMPANION_TRADEHOUSE_PILOT_ENABLED: ${COMPANION_TRADEHOUSE_PILOT_ENABLED:-true}
     command: uvicorn companion_app:app --host 0.0.0.0 --port 8082
     ports: ["8082:8082"]
     volumes: [companion-data:/app/companion-data]
@@ -32,4 +38,5 @@ services:
 volumes:
   companion-data:
 
-# Paper-only isolation: no Gold volume, no Gold runtime, no TradeHouse route.
+# Research stays isolated from Gold. Only the explicitly selected Oil/BTC path
+# may cross the TradeHouse transport boundary; all other tournament paths are paper-only.
