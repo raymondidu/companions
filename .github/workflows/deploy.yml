@@ -27,13 +27,10 @@ jobs:
             git pull origin main
             export COMPANION_DEPLOY_SHA=$(git rev-parse HEAD)
 
-            # Companion must already have its TradeHouse executor secret installed
-            # securely on the host. Never copy or print credentials from another service.
             COMPANION_ENV=/home/companions/.env
             touch "$COMPANION_ENV"
             chmod 600 "$COMPANION_ENV"
 
-            # Keep non-secret routing/configuration canonical.
             tmp="$(mktemp)"
             grep -vE '^(COMPANION_EXECUTOR_BASE_URL|COMPANION_TRADEHOUSE_PILOT_ENABLED)=' "$COMPANION_ENV" > "$tmp" || true
             cat "$tmp" > "$COMPANION_ENV"
@@ -41,7 +38,6 @@ jobs:
             printf '%s\n' 'COMPANION_EXECUTOR_BASE_URL=https://tradehouse.app' >> "$COMPANION_ENV"
             printf '%s\n' 'COMPANION_TRADEHOUSE_PILOT_ENABLED=true' >> "$COMPANION_ENV"
 
-            # Fail closed before restart if TradeHouse authentication is absent.
             if ! grep -qE '^COMPANION_EXECUTOR_SECRET=.+$' "$COMPANION_ENV" 2>/dev/null; then
               echo 'Companion TradeHouse credential is unavailable on /home/companions/.env; refusing an unconfigured deployment.' >&2
               exit 1
@@ -52,7 +48,6 @@ jobs:
             docker compose up -d --build
             docker compose ps
 
-            # Verify local runtime readiness only. Never manufacture a live trade.
             HEALTH=''
             for attempt in $(seq 1 20); do
               HEALTH="$(curl --max-time 5 -fsS http://127.0.0.1:8082/health || true)"
