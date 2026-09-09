@@ -11,6 +11,7 @@ from pathlib import Path
 from companion_markets import MARKETS
 from companion_exness_specs import CATALOG_SOURCE, CATALOG_VERIFIED_AT, validate_market_mapping
 from companion_tournament import PROFILES, Tournament
+from companion_tradehouse import deliver_selected_signal
 from market_data import BinanceBreadthData, CoinbaseData, OandaData
 
 DATA_DIR = Path(os.getenv('COMPANION_DATA_DIR', '/app/companion-data'))
@@ -119,6 +120,7 @@ async def scan_one(key: str) -> dict:
         profiles=tournament.step(m15,h1,h4,q.bid,q.ask,context)
         ranking=tournament.rank(profiles)
         leader=next((row for row in ranking if row.get('rank_eligible')),None)
+        delivery=await deliver_selected_signal(key,profiles)
         out.update(
             ok=True,state='RUNNING',
             quote={'bid':q.bid,'ask':q.ask,'time':q.time},
@@ -127,6 +129,7 @@ async def scan_one(key: str) -> dict:
             research_context=context,
             warnings=warnings,
             profiles=profiles,ranking=ranking,leader=leader,
+            tradehouse_delivery=delivery,
             promotion_policy={
                 'minimum_rank_sample':30,
                 'minimum_resolved_trades_for_ranking':30,
@@ -160,8 +163,6 @@ async def mark_open_positions(key: str) -> None:
         for store in stores:
             if store.has_open():store.mark(q.bid,q.ask)
     except Exception:
-        # The next full scan remains the authoritative health report. A
-        # transient fast-mark failure is retried without falsifying its state.
         return
 
 
