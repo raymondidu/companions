@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import os
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,7 @@ CALLBACK_EVENTS = {
     "PROTECTION_RAISED", "CLOSE_REQUESTED", "CLOSED", "OPEN_FAILED",
     "POSITION_LOST", "RECOVERED_AFTER_RESTART",
 }
+CALLBACK_MAX_AGE_MS = 5 * 60 * 1000
 
 
 def _utcnow() -> str:
@@ -29,11 +31,6 @@ def _utcnow() -> str:
 
 
 def _first_env(*names: str) -> str:
-    """Return the first non-empty configured environment value.
-
-    Companion-specific names remain preferred, but existing Gold/TradeHouse
-    deployments can be reused without duplicating secrets on the host.
-    """
     for name in names:
         value = os.getenv(name, "").strip()
         if value:
@@ -57,6 +54,14 @@ def _executor_secret() -> str:
         "GOLD_EXECUTOR_SECRET",
         "EXECUTOR_SECRET",
     )
+
+
+def _callback_secret() -> str:
+    return _first_env(
+        "COMPANION_CALLBACK_SECRET",
+        "COMPANION_CALLBACK_HMAC_SECRET",
+        "TRADEHOUSE_CALLBACK_HMAC_SECRET",
+    ) or _executor_secret()
 
 
 def _data_dir() -> Path:
@@ -88,24 +93,38 @@ def _write(path: Path, value: dict) -> None:
     tmp.replace(path)
 
 
+def _callback_position_rows(callbacks: dict):
+    for signal_id, signal in (callbacks.get("signals", {}) or {}).items():
+        positions = signal.get("positions", {}) if isinstance(signal, dict) else {}
+        if positions:
+            for tradehouse_id, position in positions.items():
+                if isinstance(position, dict):
+                    yield signal_id, tradehouse_id, position
+        elif isinstance(signal, dict) and signal.get("broker_position_id"):
+            # Backward-compatible read for pre-fanout callback state.
+            yield signal_id, str(signal.get("tradehouse_id") or signal_id), signal
+
+
 def delivery_snapshot() -> dict:
     state = _read(_state_path())
     callbacks = _read(_callback_path())
     signals = state.get("signals", {})
     callback_signals = callbacks.get("signals", {})
+    rows = list(_callback_position_rows(callbacks))
     summary = {
         "generated": len(signals),
         "sent": sum(1 for x in signals.values() if x.get("attempted_at")),
-        "accepted": sum(1 for x in signals.values() if x.get("http_status") in (200, 202) and isinstance(x.get("ack"), dict) and x["ack"].get("accepted")),
-        "opened": sum(1 for x in callback_signals.values() if x.get("broker_position_id")),
-        "closed": sum(1 for x in callback_signals.values() if x.get("lifecycle_state") == "CLOSED"),
-        "open_failed": sum(1 for x in callback_signals.values() if x.get("last_event") == "OPEN_FAILED"),
+        "accepted": sum(1 for x in signals.values() if x.get("http_status") in (200, 202) and isinstance(x.get("ack"), dict) and (x["ack"].get("accepted") is True or x["ack"].get("status") == "QUEUED")),
+        "opened": sum(1 for _, _, x in rows if x.get("broker_position_id")),
+        "closed": sum(1 for _, _, x in rows if x.get("lifecycle_state") == "CLOSED"),
+        "open_failed": sum(1 for _, _, x in rows if x.get("last_event") == "OPEN_FAILED"),
     }
     return {
         "policy_version": POLICY_VERSION,
         "cohort": COHORT,
         "active_paths": ACTIVE_PATHS,
         "executor_configured": bool(_executor_base_url() and _executor_secret()),
+        "callback_configured": bool(_callback_secret()),
         "live_enable_requested": os.getenv("COMPANION_TRADEHOUSE_PILOT_ENABLED", "false").strip().lower() == "true",
         "summary": summary,
         "signals": signals,
@@ -140,13 +159,6 @@ async def deliver_selected_signal(
     setup_key: str | None = None,
     live_gate: str | None = None,
 ) -> dict:
-    """Deliver exactly one approved fresh path per executable market.
-
-    Live evaluation is independent of the paper-wallet open/closed state. A paper
-    position may remain open for research while a genuinely new qualifying setup
-    can still be delivered. Repeated scans of the same setup candle reuse one
-    permanent signal_id and therefore cannot stack duplicate live entries.
-    """
     if market_key not in ACTIVE_PATHS:
         return {"eligible": False, "sent": False, "status": "REFUSED_INSTRUMENT"}
 
@@ -195,6 +207,7 @@ async def deliver_selected_signal(
         "path": path,
         "entry": live_candidate.get("reference_price"),
         "signal_created_at": created_at,
+        "signal": f"{EXECUTOR_INSTRUMENT[market_key]} {direction.lower()} — {path}",
     }
     record = {
         "signal_id": signal_id, "market": market_key, "instrument": payload["instrument"],
@@ -218,12 +231,17 @@ async def deliver_selected_signal(
         record.update(http_status=response.status_code, ack=ack, updated_at=_utcnow())
         signals[signal_id] = record
         _write(_state_path(), state)
+        accepted = bool(
+            isinstance(ack, dict)
+            and response.status_code in (200, 202)
+            and (ack.get("accepted") is True or ack.get("status") == "QUEUED" or ack.get("duplicate") is True or ack.get("validate_only") is True)
+        )
         return {
             "eligible": True, "sent": True, "signal_id": signal_id,
             "http_status": response.status_code,
-            "accepted": bool(isinstance(ack, dict) and ack.get("accepted")),
-            "opened": bool(isinstance(ack, dict) and ack.get("opened")),
-            "lifecycle_state": ack.get("lifecycle_state") if isinstance(ack, dict) else None,
+            "accepted": accepted,
+            "opened": False,
+            "lifecycle_state": ack.get("status") if isinstance(ack, dict) else None,
             "reason": ack.get("reason") if isinstance(ack, dict) else None,
             "reason_code": ack.get("reason_code") if isinstance(ack, dict) else None,
             "path": path, "setup_key": stable_setup_key,
@@ -236,20 +254,33 @@ async def deliver_selected_signal(
 
 
 def verify_callback_signature(body: bytes, headers: Any) -> bool:
-    secret = (_first_env("COMPANION_CALLBACK_HMAC_SECRET", "TRADEHOUSE_CALLBACK_HMAC_SECRET") or _executor_secret())
+    secret = _callback_secret()
     if not secret:
         return False
-    supplied = (headers.get("x-tradehouse-signature") or headers.get("x-executor-signature") or headers.get("x-signature") or "").strip()
-    if supplied.startswith("sha256="):
-        supplied = supplied[7:]
-    expected = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
-    return bool(supplied) and hmac.compare_digest(supplied.lower(), expected.lower())
+    timestamp = str(headers.get("x-executor-timestamp") or "").strip()
+    supplied = str(headers.get("x-executor-signature") or "").strip().lower()
+    if not timestamp or not supplied:
+        return False
+    try:
+        ts_ms = int(timestamp)
+    except Exception:
+        return False
+    if abs(int(time.time() * 1000) - ts_ms) > CALLBACK_MAX_AGE_MS:
+        return False
+    try:
+        signed = timestamp.encode("utf-8") + b"." + body
+        expected = hmac.new(secret.encode("utf-8"), signed, hashlib.sha256).hexdigest().lower()
+    except Exception:
+        return False
+    return hmac.compare_digest(supplied, expected)
 
 
 def record_callback(payload: dict) -> tuple[bool, str]:
     signal_id = str(payload.get("signal_id") or "").strip()
     event_id = str(payload.get("event_id") or "").strip()
+    tradehouse_id = str(payload.get("tradehouse_id") or "").strip()
     event_type = str(payload.get("event_type") or payload.get("event") or "").strip().upper()
+    pilot_kind = str(payload.get("pilot_kind") or "").strip()
     try:
         sequence = int(payload.get("event_sequence"))
     except Exception:
@@ -258,32 +289,65 @@ def record_callback(payload: dict) -> tuple[bool, str]:
         return False, "MISSING_SIGNAL_ID"
     if not event_id:
         return False, "MISSING_EVENT_ID"
+    if not tradehouse_id:
+        return False, "MISSING_TRADEHOUSE_ID"
     if event_type not in CALLBACK_EVENTS:
         return False, "INVALID_EVENT_TYPE"
-
-    state = _read(_callback_path())
-    signals = state.setdefault("signals", {})
-    sig = signals.setdefault(signal_id, {"last_sequence": -1, "events": {}, "lifecycle_state": None})
-    if event_id in sig["events"]:
-        return True, "DUPLICATE_EVENT"
-    if sequence <= int(sig.get("last_sequence", -1)):
-        return False, "NON_MONOTONIC_EVENT_SEQUENCE"
-
+    if pilot_kind and pilot_kind != "COMPANION_OILBTC":
+        return False, "WRONG_PILOT_KIND"
     if event_type == "OPENED" and not payload.get("broker_position_id"):
         return False, "OPENED_MISSING_BROKER_POSITION_ID"
 
-    sig["events"][event_id] = payload
-    sig["last_sequence"] = sequence
-    sig["last_event"] = event_type
-    sig["updated_at"] = _utcnow()
+    state = _read(_callback_path())
+    seen = state.setdefault("event_ids", {})
+    if event_id in seen:
+        return True, "DUPLICATE_EVENT"
+
+    signals = state.setdefault("signals", {})
+    sig = signals.setdefault(signal_id, {"positions": {}, "updated_at": _utcnow()})
+    positions = sig.setdefault("positions", {})
+    pos = positions.setdefault(tradehouse_id, {
+        "tradehouse_id": tradehouse_id,
+        "signal_id": signal_id,
+        "last_sequence": -1,
+        "events": {},
+        "lifecycle_state": None,
+    })
+    if sequence <= int(pos.get("last_sequence", -1)):
+        return False, "NON_MONOTONIC_EVENT_SEQUENCE"
+
+    pos["events"][event_id] = payload
+    pos["last_sequence"] = sequence
+    pos["last_event"] = event_type
+    pos["updated_at"] = _utcnow()
+    for field in (
+        "broker_position_id", "instrument", "direction", "symbol", "actual_fill_price",
+        "filled_lot", "strategy_capital_usd", "net_realized_pnl_usd",
+        "net_realized_return_pct", "close_reason", "pilot_kind",
+    ):
+        if payload.get(field) is not None:
+            pos[field] = payload.get(field)
+    pos["lifecycle_state"] = str(payload.get("lifecycle_state") or event_type).upper()
     if event_type == "OPENED":
-        sig["broker_position_id"] = payload.get("broker_position_id")
-        sig["actual_fill_price"] = payload.get("actual_fill_price")
-        sig["lifecycle_state"] = "OPENED"
+        pos["lifecycle_state"] = "OPENED"
     elif event_type == "CLOSED":
-        sig["net_realized_pnl_usd"] = payload.get("net_realized_pnl_usd")
-        sig["lifecycle_state"] = "CLOSED"
-    else:
-        sig["lifecycle_state"] = event_type
+        pos["lifecycle_state"] = "CLOSED"
+
+    seen[event_id] = {"signal_id": signal_id, "tradehouse_id": tradehouse_id, "recorded_at": _utcnow()}
+    sig["last_event"] = event_type
+    sig["last_tradehouse_id"] = tradehouse_id
+    sig["last_sequence"] = sequence
+    sig["lifecycle_state"] = pos["lifecycle_state"]
+    sig["updated_at"] = _utcnow()
+    # Backward-compatible dashboard summary of the most recently updated position.
+    for field in (
+        "broker_position_id", "actual_fill_price", "net_realized_pnl_usd",
+        "instrument", "direction", "symbol", "close_reason",
+    ):
+        if pos.get(field) is not None:
+            sig[field] = pos.get(field)
+
+    positions[tradehouse_id] = pos
+    signals[signal_id] = sig
     _write(_callback_path(), state)
     return True, "RECORDED"
