@@ -60,19 +60,33 @@ def _write(path: Path, value: dict) -> None:
 def delivery_snapshot() -> dict:
     state = _read(_state_path())
     callbacks = _read(_callback_path())
+    signals = state.get("signals", {})
+    callback_signals = callbacks.get("signals", {})
+    summary = {
+        "generated": len(signals),
+        "sent": sum(1 for x in signals.values() if x.get("attempted_at")),
+        "accepted": sum(1 for x in signals.values() if x.get("http_status") in (200, 202) and isinstance(x.get("ack"), dict) and x["ack"].get("accepted")),
+        "opened": sum(1 for x in callback_signals.values() if x.get("broker_position_id")),
+        "closed": sum(1 for x in callback_signals.values() if x.get("lifecycle_state") == "CLOSED"),
+        "open_failed": sum(1 for x in callback_signals.values() if x.get("last_event") == "OPEN_FAILED"),
+    }
     return {
         "policy_version": POLICY_VERSION,
         "cohort": COHORT,
         "active_paths": ACTIVE_PATHS,
         "executor_configured": bool(os.getenv("COMPANION_EXECUTOR_BASE_URL", "").strip() and os.getenv("COMPANION_EXECUTOR_SECRET", "").strip()),
         "live_enable_requested": os.getenv("COMPANION_TRADEHOUSE_PILOT_ENABLED", "false").strip().lower() == "true",
-        "signals": state.get("signals", {}),
-        "callbacks": callbacks.get("signals", {}),
+        "summary": summary,
+        "signals": signals,
+        "callbacks": callback_signals,
     }
 
 
-def _signal_id(market_key: str, path: str, row: dict) -> str:
-    raw = f"{COHORT}|{market_key}|{path}|{row.get('id')}|{row.get('opened_at') or row.get('created_at')}"
+def _signal_id(market_key: str, path: str, setup_key: str, candidate: dict) -> str:
+    raw = "|".join([
+        COHORT, market_key, path, str(setup_key),
+        str(candidate.get("direction") or ""), str(candidate.get("setup") or ""),
+    ])
     digest = hashlib.sha256(raw.encode()).hexdigest()[:24]
     prefix = "OIL" if market_key == "USOIL" else "BTC"
     return f"{prefix}-{digest}"
@@ -88,8 +102,20 @@ def _fresh_enough(created_at: str | None, max_age_seconds: int = 120) -> bool:
         return False
 
 
-async def deliver_selected_signal(market_key: str, profiles: dict) -> dict:
-    """Deliver exactly one approved path per executable market. Everything else remains research-only."""
+async def deliver_selected_signal(
+    market_key: str,
+    profiles: dict,
+    live_candidate: dict | None = None,
+    setup_key: str | None = None,
+    live_gate: str | None = None,
+) -> dict:
+    """Deliver exactly one approved fresh path per executable market.
+
+    Live evaluation is independent of the paper-wallet open/closed state. A paper
+    position may remain open for research while a genuinely new qualifying setup
+    can still be delivered. Repeated scans of the same setup candle reuse one
+    permanent signal_id and therefore cannot stack duplicate live entries.
+    """
     if market_key not in ACTIVE_PATHS:
         return {"eligible": False, "sent": False, "status": "REFUSED_INSTRUMENT"}
 
@@ -99,49 +125,54 @@ async def deliver_selected_signal(market_key: str, profiles: dict) -> dict:
     if policy.get("cohort") != COHORT:
         return {"eligible": False, "sent": False, "status": "WRONG_COHORT"}
 
-    recent = summary.get("recent") or []
-    if not recent:
-        return {"eligible": True, "sent": False, "status": "NO_SIGNAL"}
-    row = recent[0]
-    if row.get("status") != "OPEN":
-        return {"eligible": True, "sent": False, "status": "NO_NEW_OPEN_SIGNAL"}
+    if not live_candidate:
+        return {
+            "eligible": True, "sent": False, "status": "NO_FRESH_QUALIFYING_SETUP",
+            "path": path, "live_gate": live_gate or "NO_SIGNAL",
+        }
 
-    created_at = row.get("opened_at") or row.get("created_at")
-    signal_id = _signal_id(market_key, path, row)
+    created_at = str(live_candidate.get("created_at") or "")
+    if not _fresh_enough(created_at):
+        return {"eligible": True, "sent": False, "status": "STALE_SIGNAL", "path": path, "live_gate": live_gate}
+
+    stable_setup_key = str(setup_key or created_at)
+    signal_id = _signal_id(market_key, path, stable_setup_key, live_candidate)
     state = _read(_state_path())
     signals = state.setdefault("signals", {})
     existing = signals.get(signal_id)
     if existing and existing.get("http_status") in (200, 202):
-        return {"eligible": True, "sent": False, "status": "ALREADY_RECEIVED", "signal_id": signal_id, "ack": existing.get("ack")}
-
-    if not _fresh_enough(created_at):
-        signals[signal_id] = {"signal_id": signal_id, "status": "STALE_SIGNAL_LOCAL_SKIP", "updated_at": _utcnow()}
-        _write(_state_path(), state)
-        return {"eligible": True, "sent": False, "status": "STALE_SIGNAL", "signal_id": signal_id}
+        return {
+            "eligible": True, "sent": False, "status": "ALREADY_RECEIVED",
+            "signal_id": signal_id, "ack": existing.get("ack"), "path": path,
+            "setup_key": stable_setup_key,
+        }
 
     base = os.getenv("COMPANION_EXECUTOR_BASE_URL", "").strip().rstrip("/")
     secret = os.getenv("COMPANION_EXECUTOR_SECRET", "").strip()
     if not (base and secret):
-        return {"eligible": True, "sent": False, "status": "EXECUTOR_UNCONFIGURED", "signal_id": signal_id}
+        return {"eligible": True, "sent": False, "status": "EXECUTOR_UNCONFIGURED", "signal_id": signal_id, "path": path}
+
+    direction = str(live_candidate.get("direction") or "").upper()
+    if direction not in {"LONG", "SHORT"}:
+        return {"eligible": False, "sent": False, "status": "INVALID_DIRECTION", "signal_id": signal_id, "path": path}
 
     payload = {
         "signal_id": signal_id,
-        "direction": row.get("direction"),
+        "direction": direction,
         "instrument": EXECUTOR_INSTRUMENT[market_key],
         "cohort": COHORT,
         "path": path,
-        "entry": row.get("reference_price"),
+        "entry": live_candidate.get("reference_price"),
         "signal_created_at": created_at,
     }
     record = {
-        "signal_id": signal_id,
-        "market": market_key,
-        "instrument": payload["instrument"],
-        "path": path,
-        "cohort": COHORT,
-        "payload": payload,
-        "attempted_at": _utcnow(),
+        "signal_id": signal_id, "market": market_key, "instrument": payload["instrument"],
+        "path": path, "cohort": COHORT, "setup_key": stable_setup_key,
+        "live_gate": live_gate, "payload": payload, "attempted_at": _utcnow(),
     }
+    signals[signal_id] = record
+    _write(_state_path(), state)
+
     try:
         async with httpx.AsyncClient(timeout=12.0) as client:
             response = await client.post(
@@ -157,21 +188,20 @@ async def deliver_selected_signal(market_key: str, profiles: dict) -> dict:
         signals[signal_id] = record
         _write(_state_path(), state)
         return {
-            "eligible": True,
-            "sent": True,
-            "signal_id": signal_id,
+            "eligible": True, "sent": True, "signal_id": signal_id,
             "http_status": response.status_code,
             "accepted": bool(isinstance(ack, dict) and ack.get("accepted")),
             "opened": bool(isinstance(ack, dict) and ack.get("opened")),
             "lifecycle_state": ack.get("lifecycle_state") if isinstance(ack, dict) else None,
             "reason": ack.get("reason") if isinstance(ack, dict) else None,
             "reason_code": ack.get("reason_code") if isinstance(ack, dict) else None,
+            "path": path, "setup_key": stable_setup_key,
         }
     except Exception as exc:
         record.update(status="DELIVERY_ERROR", error=f"{type(exc).__name__}: {exc}", updated_at=_utcnow())
         signals[signal_id] = record
         _write(_state_path(), state)
-        return {"eligible": True, "sent": False, "status": "DELIVERY_ERROR", "signal_id": signal_id, "error": record["error"]}
+        return {"eligible": True, "sent": False, "status": "DELIVERY_ERROR", "signal_id": signal_id, "error": record["error"], "path": path}
 
 
 def verify_callback_signature(body: bytes, headers: Any) -> bool:
@@ -208,13 +238,14 @@ def record_callback(payload: dict) -> tuple[bool, str]:
     if sequence <= int(sig.get("last_sequence", -1)):
         return False, "NON_MONOTONIC_EVENT_SEQUENCE"
 
+    if event_type == "OPENED" and not payload.get("broker_position_id"):
+        return False, "OPENED_MISSING_BROKER_POSITION_ID"
+
     sig["events"][event_id] = payload
     sig["last_sequence"] = sequence
     sig["last_event"] = event_type
     sig["updated_at"] = _utcnow()
     if event_type == "OPENED":
-        if not payload.get("broker_position_id"):
-            return False, "OPENED_MISSING_BROKER_POSITION_ID"
         sig["broker_position_id"] = payload.get("broker_position_id")
         sig["actual_fill_price"] = payload.get("actual_fill_price")
         sig["lifecycle_state"] = "OPENED"
