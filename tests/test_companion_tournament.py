@@ -14,6 +14,26 @@ def frame(n=100,start=100.0,step=0.3):
     return pd.DataFrame(rows)
 
 
+def v2_frame(step, amplitude=.2, phase=.2, n=140):
+    rows=[]
+    for i in range(n):
+        close=100+i*step+math.sin(i*.9+phase)*amplitude
+        rows.append({
+            'time':pd.Timestamp('2026-01-01',tz='UTC')+pd.Timedelta(minutes=15*i),
+            'open':close-.12,'high':close+.04,'low':close-.16,'close':close,
+            'volume':100+(i%7)*5,
+        })
+    return pd.DataFrame(rows)
+
+
+def strong_long_breadth(pressure=30):
+    return {
+        'state':'LONG_FAVORED','long_allowed':True,'short_allowed':False,
+        'pressure_score':pressure,'volume_up_pct':65,'breadth_up_pct':60,
+        'major_up':4,
+    }
+
+
 def test_tournament_has_multiple_independent_profiles():
     assert len(PROFILES) >= 12
     assert len({p.key for p in PROFILES}) == len(PROFILES)
@@ -54,6 +74,20 @@ def test_ranking_requires_real_sample_before_promotion():
     ranked=Tournament.rank(fake)
     assert ranked
     assert all(x['promotion_ready'] is False for x in ranked)
+    assert all(x['rank_eligible'] is False for x in ranked)
+
+
+def test_ranking_requires_30_resolved_trades_not_open_positions():
+    fake={
+        p.key:{'opened':30,'closed':29,'first_locks':20,'worst_adverse_atr':1.0,'recent':[]}
+        for p in PROFILES
+    }
+    ranked=Tournament.rank(fake)
+    assert ranked and all(x['rank_eligible'] is False for x in ranked)
+    fake[PROFILES[0].key]['closed']=30
+    ranked=Tournament.rank(fake)
+    selected=next(x for x in ranked if x['profile']==PROFILES[0].key)
+    assert selected['rank_eligible'] is True
 
 
 def test_crypto_transfer_is_asset_class_isolated():
@@ -73,6 +107,42 @@ def test_crypto_breadth_governor_pauses_opposite_direction():
     assert state['long_allowed'] is True
     assert state['short_allowed'] is False
     assert state['pressure_score'] > 0
+
+
+def test_v2_crypto_pair_uses_identical_high_precision_entry():
+    m15=v2_frame(.03);h1=v2_frame(.10);h4=v2_frame(.18)
+    bid=float(m15.iloc[-1].close);ask=bid+.01
+    stop=next(p for p in PROFILES if p.key=='PREDICTION_V2_10X_STOP6')
+    no_stop=next(p for p in PROFILES if p.key=='PREDICTION_V2_10X_NOSTOP')
+    a,ra=evaluate_profile(MARKETS['BTC'],stop,m15,h1,h4,bid,ask,{'crypto_breadth':strong_long_breadth()})
+    b,rb=evaluate_profile(MARKETS['BTC'],no_stop,m15,h1,h4,bid,ask,{'crypto_breadth':strong_long_breadth()})
+    assert ra==rb=='ACCEPTED'
+    assert a is not None and b is not None
+    assert (a.direction,a.reference_price,a.score,a.setup)==(b.direction,b.reference_price,b.score,b.setup)
+
+
+def test_v2_crypto_rejects_permissive_but_weak_transition_breadth():
+    m15=v2_frame(.03);h1=v2_frame(.10);h4=v2_frame(.18)
+    bid=float(m15.iloc[-1].close);ask=bid+.01
+    profile=next(p for p in PROFILES if p.key=='PREDICTION_V2_10X_NOSTOP')
+    breadth=strong_long_breadth(pressure=10)
+    breadth['state']='CAUTION_TRANSITION'
+    signal,reason=evaluate_profile(MARKETS['BTC'],profile,m15,h1,h4,bid,ask,{'crypto_breadth':breadth})
+    assert signal is None
+    assert reason=='V2_CRYPTO_PRESSURE_BELOW_18'
+
+
+def test_v2_rejects_fresh_reversal_even_when_ema_structure_still_lags():
+    m15=v2_frame(.03);h1=v2_frame(.10);h4=v2_frame(.18)
+    base=float(h1.iloc[-4].close)
+    for index,drop in zip(h1.index[-3:],[.2,.4,.6]):
+        close=base-drop
+        h1.loc[index,['open','high','low','close']]=[close+.05,close+.08,close-.04,close]
+    bid=float(m15.iloc[-1].close);ask=bid+.01
+    profile=next(p for p in PROFILES if p.key=='PREDICTION_V2_PRECISION')
+    signal,reason=evaluate_profile(MARKETS['SILVER'],profile,m15,h1,h4,bid,ask)
+    assert signal is None
+    assert reason=='V2_HTF_MOMENTUM_OPPOSES_STRUCTURE'
 
 
 def test_transferred_gold_and_crypto_lanes_can_admit_clean_forward_setup():
@@ -116,6 +186,9 @@ def test_scanner_writes_running_heartbeat(tmp_path):
     assert result['state']=='RUNNING'
     assert result['ok'] is True
     assert result['profiles_evaluated']==len(PROFILES)
+    assert result['prediction_engine']=='PREDICTION_V2_STRICT_CONFIRMATION'
+    assert result['position_mark_interval_seconds'] <= result['scan_interval_seconds']
+    assert result['leader'] is None
     assert result['scan_count'] >= 1
     assert result['last_scan_completed_at']
     assert (tmp_path/'silver_status.json').exists()

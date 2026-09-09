@@ -41,6 +41,10 @@ PROFILES: tuple[EntryProfile, ...] = (
     EntryProfile('GOLD_M30_LIQUIDITY_SWEEP',78,('M30_LIQUIDITY_SWEEP',),False,0.16,(42,75),(25,58),'GOLD_TRANSFER','M30_SWEEP'),
     EntryProfile('CRYPTO_CLEAN_PATH_10X_STOP6',42,('TREND_CONTINUATION','EMA_PULLBACK'),False,0.18,(45,70),(30,55),'CRYPTO_TRANSFER','CRYPTO_CLEAN',('CRYPTO',),'CAPITAL_6_4_10X_STOP6',10.0,200.0),
     EntryProfile('CRYPTO_CLEAN_PATH_10X_NOSTOP',42,('TREND_CONTINUATION','EMA_PULLBACK'),False,0.18,(45,70),(30,55),'CRYPTO_TRANSFER','CRYPTO_CLEAN',('CRYPTO',),'CAPITAL_6_4_10X_NOSTOP',10.0,200.0),
+    # New keys keep the original evidence immutable while V2 builds a clean sample.
+    EntryProfile('PREDICTION_V2_PRECISION',86,('CONFIRMED_TREND',),True,0.12,(52,68),(32,48),'PREDICTION_V2','PREDICTION_V2'),
+    EntryProfile('PREDICTION_V2_10X_STOP6',86,('CONFIRMED_TREND',),True,0.12,(52,68),(32,48),'PREDICTION_V2','PREDICTION_V2',('CRYPTO',),'CAPITAL_6_4_10X_STOP6',10.0,200.0),
+    EntryProfile('PREDICTION_V2_10X_NOSTOP',86,('CONFIRMED_TREND',),True,0.12,(52,68),(32,48),'PREDICTION_V2','PREDICTION_V2',('CRYPTO',),'CAPITAL_6_4_10X_NOSTOP',10.0,200.0),
 )
 
 COHORT_KEY='EXNESS_SURVIVAL_V1'
@@ -154,6 +158,72 @@ def _crypto_candidate(market,profile,a15,a1,a4,bid,ask,context):
     return _signal(market,profile,direction,score,setup,atr,bid,ask,reasons),'ACCEPTED'
 
 
+def _prediction_v2_candidate(market,profile,a15,a1,a4,bid,ask,context):
+    """High-precision path that refuses lagging EMA structure on its own."""
+    r15,p2=a15.iloc[-1],a15.iloc[-3]
+    r1,r4=a1.iloc[-1],a4.iloc[-1]
+    atr=float(r15.atr14 or 0)
+    if pd.isna(atr) or atr<=0:return None,'V2_ATR_UNAVAILABLE'
+    spread=max(0.0,float(ask)-float(bid))
+    if spread/atr>profile.max_spread_atr:return None,'V2_SPREAD_TO_ATR_TOO_WIDE'
+
+    if r1.ema20>r1.ema50 and r4.ema20>r4.ema50:direction='LONG'
+    elif r1.ema20<r1.ema50 and r4.ema20<r4.ema50:direction='SHORT'
+    else:return None,'V2_H1_H4_STRUCTURE_NOT_ALIGNED'
+    sign=1 if direction=='LONG' else -1
+
+    h1_momentum=sign*float(r1.momentum_3 or 0)
+    h4_momentum=sign*float(r4.momentum_3 or 0)
+    h1_slope=sign*(float(r1.ema20)-float(a1.iloc[-4].ema20))
+    h4_slope=sign*(float(r4.ema20)-float(a4.iloc[-4].ema20))
+    if h1_momentum<=0 or h4_momentum<=0:return None,'V2_HTF_MOMENTUM_OPPOSES_STRUCTURE'
+    if h1_slope<=0 or h4_slope<=0:return None,'V2_HTF_EMA_SLOPE_NOT_CONFIRMED'
+
+    m15_momentum=sign*float(r15.momentum_3 or 0)
+    follow_through=sign*(float(r15.close)-float(p2.close))>0 and sign*(float(r15.close)-float(r15.open))>0
+    correct_side=sign*(float(r15.close)-float(r15.ema20))>0
+    rsi=float(r15.rsi14 or 50)
+    rsi_ok=profile.rsi_long[0]<=rsi<=profile.rsi_long[1] if direction=='LONG' else profile.rsi_short[0]<=rsi<=profile.rsi_short[1]
+    loc=float(r15.close_location if pd.notna(r15.close_location) else .5)
+    body=float(r15.body_ratio if pd.notna(r15.body_ratio) else 0)
+    candle_confirmed=body>=.30 and (loc>=.60 if direction=='LONG' else loc<=.40)
+    if m15_momentum<=0 or not follow_through:return None,'V2_TWO_CANDLE_FOLLOW_THROUGH_NOT_CONFIRMED'
+    if not correct_side or not rsi_ok:return None,'V2_M15_MOMENTUM_NOT_CONFIRMED'
+    if not candle_confirmed:return None,'V2_ENTRY_CANDLE_NOT_CONFIRMED'
+
+    adx=float(r15.adx14 or 0)
+    volume=float(r15.volume/max(float(r15.volume_ma20 or 0),1e-9))
+    extension=abs(float(r15.close)-float(r15.ema20))/atr
+    if adx<20:return None,'V2_ADX_BELOW_20'
+    if volume<.90:return None,'V2_VOLUME_BELOW_0_9X'
+    if extension>1.25:return None,'V2_ENTRY_OVEREXTENDED_ABOVE_1_25_ATR'
+
+    reasons=[
+        'V2_STRICT_H1_H4_STRUCTURE','V2_HTF_MOMENTUM_AND_SLOPE',
+        'V2_TWO_CANDLE_FOLLOW_THROUGH',f'V2_ADX_{adx:.1f}',
+        f'V2_VOLUME_{volume:.2f}X',f'V2_EXTENSION_{extension:.2f}_ATR',
+    ]
+    if market.asset_class=='CRYPTO':
+        breadth=context.get('crypto_breadth') or {}
+        if not breadth:return None,'V2_CRYPTO_MARKET_BREADTH_UNAVAILABLE'
+        if direction=='LONG' and not breadth.get('long_allowed'):return None,'V2_MARKET_GOVERNOR_PAUSED_LONG'
+        if direction=='SHORT' and not breadth.get('short_allowed'):return None,'V2_MARKET_GOVERNOR_PAUSED_SHORT'
+        pressure=sign*float(breadth.get('pressure_score') or 0)
+        directional_volume=float(breadth.get('volume_up_pct' if direction=='LONG' else 'volume_down_pct') or 0)
+        directional_breadth=float(breadth.get('breadth_up_pct' if direction=='LONG' else 'breadth_down_pct') or 0)
+        directional_majors=int(breadth.get('major_up' if direction=='LONG' else 'major_down') or 0)
+        if pressure<18:return None,'V2_CRYPTO_PRESSURE_BELOW_18'
+        if directional_volume<52 or directional_breadth<45:return None,'V2_CRYPTO_BREADTH_NOT_DOMINANT'
+        if directional_majors<2:return None,'V2_CRYPTO_MAJOR_ALIGNMENT_BELOW_2'
+        reasons.extend((
+            f'V2_BREADTH_{breadth.get("state")}',f'V2_PRESSURE_{breadth.get("pressure_score")}',
+            f'V2_DIRECTIONAL_VOLUME_{directional_volume:.1f}',f'V2_MAJOR_ALIGNMENT_{directional_majors}',
+        ))
+
+    score=min(100,86+int(min(8,max(0,adx-20))/2)+int(min(6,max(0,(volume-.9)*10))))
+    return _signal(market,profile,direction,score,'CONFIRMED_TREND',atr,bid,ask,reasons),'ACCEPTED'
+
+
 def evaluate_profile(market: CompanionMarket, profile: EntryProfile, m15: pd.DataFrame, h1: pd.DataFrame, h4: pd.DataFrame, bid: float, ask: float, context: dict | None = None):
     if min(len(m15),len(h1),len(h4)) < 60:
         return None,'INSUFFICIENT_HISTORY'
@@ -167,6 +237,8 @@ def evaluate_profile(market: CompanionMarket, profile: EntryProfile, m15: pd.Dat
         return _m30_candidate(market,profile,m15,h1,h4,bid,ask)
     if profile.mode=='CRYPTO_CLEAN':
         return _crypto_candidate(market,profile,a15,a1,a4,bid,ask,context)
+    if profile.mode=='PREDICTION_V2':
+        return _prediction_v2_candidate(market,profile,a15,a1,a4,bid,ask,context)
     r15,r1,r4=a15.iloc[-1],a1.iloc[-1],a4.iloc[-1]
     if pd.isna(r15.atr14) or float(r15.atr14) <= 0:
         return None,'ATR_UNAVAILABLE'
@@ -259,5 +331,5 @@ class Tournament:
             evidence=min(opened,30)/30.0
             quality=(lock_rate*0.55)+(max(-50.0,min(50.0,realized))*0.25)-(worst*8.0)+(closed*0.20)
             policy=s.get('research_policy') or {}
-            rows.append({'profile':key,'family':s.get('family'),'execution_model':policy.get('execution_model'),'paper_trade_usd':policy.get('paper_trade_usd'),'paper_lot_size':policy.get('paper_lot_size'),'sizing_basis':policy.get('sizing_basis'),'starting_equity_usd':policy.get('starting_equity_usd'),'cohort':policy.get('cohort'),'leverage':policy.get('leverage'),'last_decision':s.get('last_decision'),'opened':opened,'closed':closed,'open_pnl_usd':s.get('open_pnl_usd',0),'realized_pnl_usd':round(realized_pnl,2),'first_locks':locks,'first_lock_rate_pct':round(lock_rate,2),'true_confidence_rate_pct':s.get('true_confidence_rate_pct',0),'realized_capital_return_sum_pct':round(realized,4),'worst_adverse_atr':round(worst,3),'worst_adverse_capital_pct':s.get('worst_adverse_capital_pct',0),'evidence_weight':round(evidence,3),'research_score':round(quality*evidence,3),'promotion_ready': closed>=200 and lock_rate>=80 and worst<=2.0})
+            rows.append({'profile':key,'family':s.get('family'),'execution_model':policy.get('execution_model'),'paper_trade_usd':policy.get('paper_trade_usd'),'paper_lot_size':policy.get('paper_lot_size'),'sizing_basis':policy.get('sizing_basis'),'starting_equity_usd':policy.get('starting_equity_usd'),'cohort':policy.get('cohort'),'leverage':policy.get('leverage'),'last_decision':s.get('last_decision'),'opened':opened,'closed':closed,'open_pnl_usd':s.get('open_pnl_usd',0),'realized_pnl_usd':round(realized_pnl,2),'first_locks':locks,'first_lock_rate_pct':round(lock_rate,2),'true_confidence_rate_pct':s.get('true_confidence_rate_pct',0),'realized_capital_return_sum_pct':round(realized,4),'worst_adverse_atr':round(worst,3),'worst_adverse_capital_pct':s.get('worst_adverse_capital_pct',0),'evidence_weight':round(evidence,3),'research_score':round(quality*evidence,3),'rank_eligible':closed>=30,'promotion_ready': closed>=200 and lock_rate>=80 and worst<=2.0})
         return sorted(rows,key=lambda x:(x['promotion_ready'],x['research_score'],x['first_lock_rate_pct']),reverse=True)

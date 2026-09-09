@@ -10,11 +10,12 @@ from pathlib import Path
 
 from companion_markets import MARKETS
 from companion_exness_specs import CATALOG_SOURCE, CATALOG_VERIFIED_AT, validate_market_mapping
-from companion_tournament import Tournament
+from companion_tournament import PROFILES, Tournament
 from market_data import BinanceBreadthData, CoinbaseData, OandaData
 
 DATA_DIR = Path(os.getenv('COMPANION_DATA_DIR', '/app/companion-data'))
 SCAN_SECONDS = max(30, int(os.getenv('COMPANION_SCAN_INTERVAL_SECONDS', '60')))
+POSITION_MARK_SECONDS = max(5, int(os.getenv('COMPANION_POSITION_MARK_SECONDS', '10')))
 STARTED_AT = datetime.now(timezone.utc).isoformat()
 SCAN_COUNTS = {key: 0 for key in MARKETS}
 
@@ -86,6 +87,9 @@ async def scan_one(key: str) -> dict:
         'last_scan_started_at': scan_started_at,
         'scan_count': SCAN_COUNTS[key],
         'scan_interval_seconds': SCAN_SECONDS,
+        'position_mark_interval_seconds': POSITION_MARK_SECONDS,
+        'prediction_engine': 'PREDICTION_V2_STRICT_CONFIRMATION',
+        'legacy_paths_preserved_as_controls': True,
         'deploy_sha': os.getenv('COMPANION_DEPLOY_SHA', 'UNKNOWN'),
     }
     try:
@@ -114,7 +118,7 @@ async def scan_one(key: str) -> dict:
         tournament=Tournament(DATA_DIR/'tournament',cfg)
         profiles=tournament.step(m15,h1,h4,q.bid,q.ask,context)
         ranking=tournament.rank(profiles)
-        leader=next((row for row in ranking if int(row.get('opened',0))>0),None)
+        leader=next((row for row in ranking if row.get('rank_eligible')),None)
         out.update(
             ok=True,state='RUNNING',
             quote={'bid':q.bid,'ask':q.ask,'time':q.time},
@@ -125,6 +129,7 @@ async def scan_one(key: str) -> dict:
             profiles=profiles,ranking=ranking,leader=leader,
             promotion_policy={
                 'minimum_rank_sample':30,
+                'minimum_resolved_trades_for_ranking':30,
                 'minimum_resolved_trades_for_promotion':200,
                 'minimum_first_lock_rate_pct':80,
                 'maximum_worst_adverse_atr':2.0,
@@ -141,6 +146,25 @@ async def scan_one(key: str) -> dict:
     return out
 
 
+async def mark_open_positions(key: str) -> None:
+    """Use quote-only updates between full scans to reduce stop/lock overshoot."""
+    try:
+        cfg=MARKETS[key]
+        symbol=_provider_symbol(key,cfg.provider_symbol)
+        data,_=_provider(key,symbol)
+        if data is None:return
+        tournament=Tournament(DATA_DIR/'tournament',cfg)
+        stores=[tournament.store(profile) for profile in PROFILES]
+        if not any(store.has_open() for store in stores):return
+        q=await data.quote()
+        for store in stores:
+            if store.has_open():store.mark(q.bid,q.ask)
+    except Exception:
+        # The next full scan remains the authoritative health report. A
+        # transient fast-mark failure is retried without falsifying its state.
+        return
+
+
 async def run_forever() -> None:
     DATA_DIR.mkdir(parents=True,exist_ok=True)
     for key, cfg in MARKETS.items():
@@ -154,7 +178,12 @@ async def run_forever() -> None:
         })
     while True:
         await asyncio.gather(*(scan_one(k) for k in MARKETS))
-        await asyncio.sleep(SCAN_SECONDS)
+        deadline=time.monotonic()+SCAN_SECONDS
+        while True:
+            remaining=deadline-time.monotonic()
+            if remaining<=0:break
+            await asyncio.sleep(min(POSITION_MARK_SECONDS,remaining))
+            await asyncio.gather(*(mark_open_positions(k) for k in MARKETS))
 
 
 if __name__ == '__main__':
