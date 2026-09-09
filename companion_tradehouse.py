@@ -28,6 +28,37 @@ def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _first_env(*names: str) -> str:
+    """Return the first non-empty configured environment value.
+
+    Companion-specific names remain preferred, but existing Gold/TradeHouse
+    deployments can be reused without duplicating secrets on the host.
+    """
+    for name in names:
+        value = os.getenv(name, "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _executor_base_url() -> str:
+    return _first_env(
+        "COMPANION_EXECUTOR_BASE_URL",
+        "TRADEHOUSE_EXECUTOR_BASE_URL",
+        "GOLD_EXECUTOR_BASE_URL",
+        "EXECUTOR_BASE_URL",
+    ).rstrip("/")
+
+
+def _executor_secret() -> str:
+    return _first_env(
+        "COMPANION_EXECUTOR_SECRET",
+        "TRADEHOUSE_EXECUTOR_SECRET",
+        "GOLD_EXECUTOR_SECRET",
+        "EXECUTOR_SECRET",
+    )
+
+
 def _data_dir() -> Path:
     return Path(os.getenv("COMPANION_DATA_DIR", "/app/companion-data"))
 
@@ -74,7 +105,7 @@ def delivery_snapshot() -> dict:
         "policy_version": POLICY_VERSION,
         "cohort": COHORT,
         "active_paths": ACTIVE_PATHS,
-        "executor_configured": bool(os.getenv("COMPANION_EXECUTOR_BASE_URL", "").strip() and os.getenv("COMPANION_EXECUTOR_SECRET", "").strip()),
+        "executor_configured": bool(_executor_base_url() and _executor_secret()),
         "live_enable_requested": os.getenv("COMPANION_TRADEHOUSE_PILOT_ENABLED", "false").strip().lower() == "true",
         "summary": summary,
         "signals": signals,
@@ -147,8 +178,8 @@ async def deliver_selected_signal(
             "setup_key": stable_setup_key,
         }
 
-    base = os.getenv("COMPANION_EXECUTOR_BASE_URL", "").strip().rstrip("/")
-    secret = os.getenv("COMPANION_EXECUTOR_SECRET", "").strip()
+    base = _executor_base_url()
+    secret = _executor_secret()
     if not (base and secret):
         return {"eligible": True, "sent": False, "status": "EXECUTOR_UNCONFIGURED", "signal_id": signal_id, "path": path}
 
@@ -205,7 +236,7 @@ async def deliver_selected_signal(
 
 
 def verify_callback_signature(body: bytes, headers: Any) -> bool:
-    secret = (os.getenv("COMPANION_CALLBACK_HMAC_SECRET", "").strip() or os.getenv("COMPANION_EXECUTOR_SECRET", "").strip())
+    secret = (_first_env("COMPANION_CALLBACK_HMAC_SECRET", "TRADEHOUSE_CALLBACK_HMAC_SECRET") or _executor_secret())
     if not secret:
         return False
     supplied = (headers.get("x-tradehouse-signature") or headers.get("x-executor-signature") or headers.get("x-signature") or "").strip()
