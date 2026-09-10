@@ -126,12 +126,30 @@ def delivery_snapshot() -> dict:
             or "UNSPECIFIED_OPEN_FAILURE"
         )
         failure_reasons[reason] = failure_reasons.get(reason, 0) + 1
+    # generated/sent/accepted count SIGNALS. opened/closed count POSITIONS, because
+    # one signal fans out to many funded accounts. Mixing the two in one row is why
+    # opened could read higher than accepted and look impossible. Both bases are now
+    # published explicitly; the original keys keep their existing meaning so nothing
+    # reading them changes.
+    opened_rows = [(sid, tid, x) for sid, tid, x in rows if x.get("broker_position_id")]
+    closed_rows = [(sid, tid, x) for sid, tid, x in rows if x.get("lifecycle_state") == "CLOSED"]
     summary = {
         "generated": len(signals),
         "sent": sum(1 for x in signals.values() if x.get("attempted_at")),
         "accepted": sum(1 for x in signals.values() if x.get("http_status") in (200, 202) and isinstance(x.get("ack"), dict) and (x["ack"].get("accepted") is True or x["ack"].get("status") == "QUEUED")),
-        "opened": sum(1 for _, _, x in rows if x.get("broker_position_id")),
-        "closed": sum(1 for _, _, x in rows if x.get("lifecycle_state") == "CLOSED"),
+        "opened": len(opened_rows),
+        "closed": len(closed_rows),
+        # Explicit per-basis counts. TradeHouse's "opened for N accounts" is
+        # opened_positions; distinct signals that opened anywhere is opened_signals.
+        "opened_positions": len(opened_rows),
+        "closed_positions": len(closed_rows),
+        "opened_signals": len({sid for sid, _, _ in opened_rows}),
+        "closed_signals": len({sid for sid, _, _ in closed_rows}),
+        "counting_basis": {
+            "signals": ["generated", "sent", "accepted", "opened_signals", "closed_signals", "open_failed_signals"],
+            "positions": ["opened_positions", "closed_positions", "open_failed_positions"],
+            "note": "one signal fans out to many accounts; position counts can exceed signal counts",
+        },
         "open_failed": len(failed_rows),
         "open_failed_positions": len(failed_rows),
         "open_failed_signals": len(failed_signal_ids),
