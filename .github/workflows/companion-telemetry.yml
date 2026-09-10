@@ -74,8 +74,12 @@ jobs:
                 'generated': summary.get('generated'),
                 'sent': summary.get('sent'),
                 'accepted': summary.get('accepted'),
-                'opened': summary.get('opened'),
-                'closed': summary.get('closed'),
+                # Signals and positions kept apart: one signal fans out to many
+                # accounts, so position counts can exceed signal counts legitimately.
+                'opened_signals': summary.get('opened_signals'),
+                'opened_positions': summary.get('opened_positions'),
+                'closed_signals': summary.get('closed_signals'),
+                'closed_positions': summary.get('closed_positions'),
                 'open_failed_signals': summary.get('open_failed_signals'),
                 'open_failed_positions': summary.get('open_failed_positions'),
             })
