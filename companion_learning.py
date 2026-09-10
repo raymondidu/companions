@@ -18,6 +18,8 @@ LIVE_PATHS = {
     'USOIL': 'BALANCED_CLEAN',
     'BTC': 'GOLD_M30_LOCAL_STRUCTURE',
 }
+POLICY_GATES = {'REFUSED_INSTRUMENT'}
+NON_OPTIMIZABLE_GATES = POLICY_GATES | {'ACCEPTED', 'WALLET_BUSY'}
 
 MIN_RANK_SAMPLE = 30
 MIN_PROMOTION_RESOLVED = 200
@@ -54,8 +56,6 @@ def _append_history(data_dir: Path, market: str, record: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open('a', encoding='utf-8') as fh:
         fh.write(json.dumps(record, sort_keys=True, default=str) + '\n')
-
-    # Keep disk use bounded while retaining enough history for regime/gate trends.
     try:
         lines = path.read_text(encoding='utf-8').splitlines()
         if len(lines) > HISTORY_LIMIT:
@@ -90,7 +90,6 @@ def _profile_metrics(row: dict) -> dict:
     adverse_atr = abs(_f(row.get('worst_adverse_atr')))
     adverse_capital = abs(_f(row.get('worst_adverse_capital_pct')))
     research_score = _f(row.get('research_score'))
-
     pnl_per_closed = realized / closed if closed else 0.0
     sample_factor = min(1.0, closed / MIN_RANK_SAMPLE) if closed else 0.0
     drawdown_penalty = max(0.0, adverse_atr - 2.0) * 0.6 + max(0.0, adverse_capital - 10.0) * 0.04
@@ -101,7 +100,6 @@ def _profile_metrics(row: dict) -> dict:
         + max(-2.0, min(2.0, pnl_per_closed / 10.0))
         - drawdown_penalty
     ) * (0.35 + 0.65 * sample_factor)
-
     return {
         'opened': opened,
         'closed': closed,
@@ -127,7 +125,6 @@ def build_learning_report(
     context: dict | None,
     scan_count: int,
 ) -> dict:
-    """Persist one scan and return a conservative learning/recommendation report."""
     now = _utcnow()
     live_path = LIVE_PATHS.get(market)
     context = context or {}
@@ -140,12 +137,7 @@ def build_learning_report(
         if not name:
             continue
         metrics = _profile_metrics(row)
-        item = {
-            'profile': name,
-            'family': row.get('family'),
-            'last_decision': row.get('last_decision'),
-            **metrics,
-        }
+        item = {'profile': name, 'family': row.get('family'), 'last_decision': row.get('last_decision'), **metrics}
         compact_profiles.append(item)
         by_profile[name] = item
 
@@ -204,41 +196,28 @@ def build_learning_report(
 
     if champion:
         if champion['closed'] < MIN_RANK_SAMPLE:
-            observations.append(
-                f"Live champion {live_path} is still low-sample ({champion['closed']}/{MIN_RANK_SAMPLE} resolved for mature ranking)."
-            )
+            observations.append(f"Live champion {live_path} is still low-sample ({champion['closed']}/{MIN_RANK_SAMPLE} resolved for mature ranking).")
         if champion['realized_pnl_usd'] > 0:
-            observations.append(
-                f"Live champion {live_path} remains profitable in paper evidence: ${champion['realized_pnl_usd']:.2f} realized."
-            )
+            observations.append(f"Live champion {live_path} remains profitable in paper evidence: ${champion['realized_pnl_usd']:.2f} realized.")
         if champion['true_confidence_rate_pct'] < 60 and champion['opened'] >= 2:
-            warnings.append(
-                f"{live_path} true-confidence is only {champion['true_confidence_rate_pct']:.1f}%; collect more evidence before increasing trust."
-            )
+            warnings.append(f"{live_path} true-confidence is only {champion['true_confidence_rate_pct']:.1f}%; collect more evidence before increasing trust.")
         if champion['worst_adverse_capital_pct'] >= 10:
-            warnings.append(
-                f"{live_path} has experienced {champion['worst_adverse_capital_pct']:.1f}% adverse capital excursion in paper research."
-            )
+            warnings.append(f"{live_path} has experienced {champion['worst_adverse_capital_pct']:.1f}% adverse capital excursion in paper research.")
 
     if best_research and champion and best_research['profile'] != live_path:
-        observations.append(
-            f"Current research leader is {best_research['profile']} (evidence score {best_research['evidence_score']}) versus live {live_path} ({champion['evidence_score']})."
-        )
+        observations.append(f"Current research leader is {best_research['profile']} (evidence score {best_research['evidence_score']}) versus live {live_path} ({champion['evidence_score']}).")
         if best_research['closed'] < MIN_PROMOTION_RESOLVED:
-            actions.append(
-                f"Keep {best_research['profile']} paper-only until at least {MIN_PROMOTION_RESOLVED} resolved trades and promotion-quality drawdown/lock evidence."
-            )
+            actions.append(f"Keep {best_research['profile']} paper-only until at least {MIN_PROMOTION_RESOLVED} resolved trades and promotion-quality drawdown/lock evidence.")
 
     if history:
         top_gates = gate_counts.most_common(3)
-        observations.append(
-            'Recent live-gate distribution: ' + ', '.join(f'{name} {count}/{len(history)}' for name, count in top_gates) + '.'
-        )
+        observations.append('Recent live-gate distribution: ' + ', '.join(f'{name} {count}/{len(history)}' for name, count in top_gates) + '.')
         dominant_gate, dominant_count = top_gates[0]
-        if dominant_count / len(history) >= 0.70 and dominant_gate not in {'ACCEPTED', 'WALLET_BUSY'}:
-            actions.append(
-                f"Study {dominant_gate} as the dominant opportunity filter ({dominant_count}/{len(history)} scans); do not loosen it without controlled paper evidence showing better profit and drawdown."
-            )
+        if dominant_gate in POLICY_GATES:
+            observations.append(f'{dominant_gate} is an intentional POLICY GATE, not a prediction-quality filter.')
+            actions.append(f'Keep {dominant_gate} non-optimizable; it exists to enforce the live instrument allowlist.')
+        elif dominant_count / len(history) >= 0.70 and dominant_gate not in NON_OPTIMIZABLE_GATES:
+            actions.append(f"Study {dominant_gate} as the dominant opportunity filter ({dominant_count}/{len(history)} scans); do not loosen it without controlled paper evidence showing better profit and drawdown.")
 
     if market == 'BTC' and governor_counts:
         state, count = governor_counts.most_common(1)[0]
@@ -260,6 +239,7 @@ def build_learning_report(
         'champion': champion,
         'research_leader': best_research,
         'gate_frequency': dict(gate_counts.most_common()),
+        'gate_classification': {g: ('POLICY_GATE' if g in POLICY_GATES else 'RESEARCH_GATE') for g in gate_counts},
         'profile_gate_frequency': {k: dict(v.most_common()) for k, v in profile_gate_counts.items()},
         'promotion_candidates': promotion_candidates,
         'observations': observations,
@@ -273,5 +253,6 @@ def build_learning_report(
             'minimum_first_lock_rate_pct': MIN_FIRST_LOCK_RATE,
             'maximum_worst_adverse_atr': MAX_PROMOTION_ADVERSE_ATR,
             'requires_human_review_for_live_change': True,
+            'policy_gates_non_optimizable': sorted(POLICY_GATES),
         },
     }
