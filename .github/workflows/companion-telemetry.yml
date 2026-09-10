@@ -1,0 +1,126 @@
+name: Companion Production Telemetry
+
+# Read-only production visibility. This workflow never writes, deploys, restarts
+# a container, or touches strategy, gates, routing or the live allowlist. It reads
+# the dashboard's own /health endpoint from inside the host and prints a compact
+# summary so the live state of each market is recoverable from the run log alone.
+#
+# workflow_dispatch is deliberate: it makes current production state available on
+# demand, not only on the schedule.
+
+on:
+  schedule:
+    - cron: '3,18,33,48 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: companion-telemetry
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  telemetry:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: Read live companion state
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.DO_HOST }}
+          username: ${{ secrets.DO_USER }}
+          key: ${{ secrets.DO_SSH_KEY }}
+          port: 22
+          timeout: 45s
+          command_timeout: 5m
+          script: |
+            set -euo pipefail
+            cd /home/companions
+
+            echo "COMPANION_PRODUCTION_SHA $(git rev-parse HEAD)"
+            docker compose ps --format '{{.Service}} {{.Status}}' || true
+
+            curl --connect-timeout 5 --max-time 25 -fsS http://127.0.0.1:8082/health -o /tmp/companion_health.json
+
+            python3 - <<'PY'
+            import json
+
+            health = json.load(open('/tmp/companion_health.json'))
+            th = health.get('tradehouse') or {}
+            summary = th.get('summary') or {}
+
+            print('COMPANION_SERVICE', {
+                'ok': health.get('ok'),
+                'deploy_sha': health.get('deploy_sha'),
+                'service': health.get('service'),
+            })
+
+            # Live routing contract. active_paths is the allowlist actually in force,
+            # not what a comment or dashboard label claims.
+            print('COMPANION_LIVE_CONTRACT', {
+                'policy_version': th.get('policy_version'),
+                'cohort': th.get('cohort'),
+                'active_paths': th.get('active_paths'),
+                'executor_configured': th.get('executor_configured'),
+                'callback_configured': th.get('callback_configured'),
+                'pilot_flag': th.get('live_enable_requested'),
+            })
+
+            # Lifecycle truth. Generated != sent != accepted != opened != closed.
+            # open_failed_signals and open_failed_positions are different numbers:
+            # one signal fans out to many accounts.
+            print('COMPANION_LIFECYCLE', {
+                'generated': summary.get('generated'),
+                'sent': summary.get('sent'),
+                'accepted': summary.get('accepted'),
+                'opened': summary.get('opened'),
+                'closed': summary.get('closed'),
+                'open_failed_signals': summary.get('open_failed_signals'),
+                'open_failed_positions': summary.get('open_failed_positions'),
+            })
+
+            reasons = th.get('open_failure_reasons') or {}
+            print('COMPANION_OPEN_FAILURE_REASONS', reasons if reasons else 'NONE')
+
+            for key, market in sorted((health.get('markets') or {}).items()):
+                candidate = market.get('live_signal_candidate') or {}
+                delivery = market.get('tradehouse_delivery')
+                delivery = delivery if isinstance(delivery, dict) else {}
+                bars = market.get('data') or {}
+                breadth = (market.get('research_context') or {}).get('crypto_breadth') or {}
+
+                row = {
+                    'state': market.get('state'),
+                    # The gate is the answer to "why is nothing being sent for this market".
+                    'live_gate': market.get('live_signal_gate'),
+                    'candidate': (
+                        f"{candidate.get('direction')} @ {candidate.get('reference_price')}"
+                        if candidate else None
+                    ),
+                    'delivery_status': delivery.get('status') or delivery.get('lifecycle_state'),
+                    'delivery_signal_id': delivery.get('signal_id'),
+                    'bars_m15_h1_h4': [
+                        bars.get('m15_candles'), bars.get('h1_candles'), bars.get('h4_candles'),
+                    ],
+                    'heartbeat_age_s': market.get('heartbeat_age_seconds'),
+                    'heartbeat_stale': market.get('heartbeat_stale'),
+                    'scans': market.get('scan_count'),
+                    'provider': market.get('provider'),
+                }
+                if breadth:
+                    row['crypto_governor'] = {
+                        'state': breadth.get('state'),
+                        'long_allowed': breadth.get('long_allowed'),
+                        'short_allowed': breadth.get('short_allowed'),
+                        'pressure': breadth.get('pressure_score'),
+                    }
+                if market.get('warnings'):
+                    row['warnings'] = market.get('warnings')
+                if market.get('error'):
+                    row['error'] = market.get('error')
+
+                print(f'COMPANION_MARKET {key}', row)
+
+            print('COMPANION_TELEMETRY_COMPLETE')
+            PY
