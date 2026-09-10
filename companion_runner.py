@@ -179,16 +179,31 @@ async def scan_one(key: str) -> dict:
             learning.setdefault('observations',[]).append(
                 f"Rejected-signal shadows resolved: {protected} protected losers, {blocked} blocked +15% opportunities."
             )
-            for gate,stats in (counterfactual.get('by_gate') or {}).items():
-                decisive=int(stats.get('protected_losers') or 0)+int(stats.get('blocked_winners') or 0)
-                if decisive>=20 and (stats.get('blocked_winner_rate_pct') or 0)>=60:
-                    learning.setdefault('recommended_actions',[]).append(
-                        f"{gate} blocked profitable shadows {stats['blocked_winner_rate_pct']}% of decisive cases ({decisive} sample); investigate a paper-only challenger with a controlled relaxation, not a live gate change."
-                    )
-                if decisive>=20 and (stats.get('protect_rate_pct') or 0)>=70:
-                    learning.setdefault('observations',[]).append(
-                        f"{gate} is currently protective: {stats['protect_rate_pct']}% of decisive shadow outcomes reached -10% adverse before +15%."
-                    )
+
+        for gate,stats in (counterfactual.get('by_gate') or {}).items():
+            tracked=int(stats.get('tracked') or 0)
+            decisive=int(stats.get('protected_losers') or 0)+int(stats.get('blocked_winners') or 0)
+            if tracked >= 10:
+                learning.setdefault('observations',[]).append(
+                    f"{gate} shadow edge ({tracked} tracked): avg MFE {stats.get('avg_mfe_capital_pct')}%, avg MAE {stats.get('avg_mae_capital_pct')}%; reached +5% {stats.get('reached_5pct',0)}, +7.5% {stats.get('reached_7.5pct',0)}, +10% {stats.get('reached_10pct',0)}."
+                )
+                h1=(stats.get('horizons') or {}).get('1h') or {}
+                h4=(stats.get('horizons') or {}).get('4h') or {}
+                h12=(stats.get('horizons') or {}).get('12h') or {}
+                horizon_bits=[]
+                for label,h in [('1h',h1),('4h',h4),('12h',h12)]:
+                    if int(h.get('samples') or 0)>0:
+                        horizon_bits.append(f"{label}: {h['samples']} samples, avg {h.get('avg_capital_return_pct')}%, positive {h.get('positive_rate_pct')}%")
+                if horizon_bits:
+                    learning.setdefault('observations',[]).append(f"{gate} forward horizons — " + '; '.join(horizon_bits) + '.')
+            if decisive>=20 and (stats.get('blocked_winner_rate_pct') or 0)>=60:
+                learning.setdefault('recommended_actions',[]).append(
+                    f"{gate} blocked profitable shadows {stats['blocked_winner_rate_pct']}% of decisive cases ({decisive} sample); investigate a paper-only challenger with a controlled relaxation, not a live gate change."
+                )
+            if decisive>=20 and (stats.get('protect_rate_pct') or 0)>=70:
+                learning.setdefault('observations',[]).append(
+                    f"{gate} is currently protective: {stats['protect_rate_pct']}% of decisive shadow outcomes reached -10% adverse before +15%."
+                )
 
         regime_learning=build_regime_report(DATA_DIR,key)
         learning['regime_learning']=regime_learning
