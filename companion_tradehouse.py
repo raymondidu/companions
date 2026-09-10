@@ -19,7 +19,7 @@ ACTIVE_PATHS = {
 }
 EXECUTOR_INSTRUMENT = {"USOIL": "USOIL", "BTC": "BTCUSD"}
 CALLBACK_EVENTS = {
-    "RECEIVED", "OPENING", "OPENED", "POSITION_UPDATE", "PROTECTION_ARMED",
+    "ACCEPTED", "RECEIVED", "OPENING", "OPENED", "POSITION_UPDATE", "PROTECTION_ARMED",
     "PROTECTION_RAISED", "CLOSE_REQUESTED", "CLOSED", "OPEN_FAILED",
     "POSITION_LOST", "RECOVERED_AFTER_RESTART",
 }
@@ -101,7 +101,6 @@ def _callback_position_rows(callbacks: dict):
                 if isinstance(position, dict):
                     yield signal_id, tradehouse_id, position
         elif isinstance(signal, dict) and signal.get("broker_position_id"):
-            # Backward-compatible read for pre-fanout callback state.
             yield signal_id, str(signal.get("tradehouse_id") or signal_id), signal
 
 
@@ -111,13 +110,31 @@ def delivery_snapshot() -> dict:
     signals = state.get("signals", {})
     callback_signals = callbacks.get("signals", {})
     rows = list(_callback_position_rows(callbacks))
+    failed_rows = [(sid, tid, pos) for sid, tid, pos in rows if pos.get("last_event") == "OPEN_FAILED"]
+    failed_signal_ids = {sid for sid, _, _ in failed_rows}
+    failure_reasons: dict[str, int] = {}
+    for _, _, pos in failed_rows:
+        reason = str(
+            pos.get("reason_code")
+            or pos.get("error_code")
+            or pos.get("open_failure_reason")
+            or pos.get("broker_error_code")
+            or pos.get("reason")
+            or pos.get("error_message")
+            or pos.get("broker_error_message")
+            or pos.get("message")
+            or "UNSPECIFIED_OPEN_FAILURE"
+        )
+        failure_reasons[reason] = failure_reasons.get(reason, 0) + 1
     summary = {
         "generated": len(signals),
         "sent": sum(1 for x in signals.values() if x.get("attempted_at")),
         "accepted": sum(1 for x in signals.values() if x.get("http_status") in (200, 202) and isinstance(x.get("ack"), dict) and (x["ack"].get("accepted") is True or x["ack"].get("status") == "QUEUED")),
         "opened": sum(1 for _, _, x in rows if x.get("broker_position_id")),
         "closed": sum(1 for _, _, x in rows if x.get("lifecycle_state") == "CLOSED"),
-        "open_failed": sum(1 for _, _, x in rows if x.get("last_event") == "OPEN_FAILED"),
+        "open_failed": len(failed_rows),
+        "open_failed_positions": len(failed_rows),
+        "open_failed_signals": len(failed_signal_ids),
     }
     return {
         "policy_version": POLICY_VERSION,
@@ -127,6 +144,7 @@ def delivery_snapshot() -> dict:
         "callback_configured": bool(_callback_secret()),
         "live_enable_requested": os.getenv("COMPANION_TRADEHOUSE_PILOT_ENABLED", "false").strip().lower() == "true",
         "summary": summary,
+        "open_failure_reasons": dict(sorted(failure_reasons.items(), key=lambda kv: kv[1], reverse=True)),
         "signals": signals,
         "callbacks": callback_signals,
     }
@@ -195,24 +213,26 @@ async def deliver_selected_signal(
     if not (base and secret):
         return {"eligible": True, "sent": False, "status": "EXECUTOR_UNCONFIGURED", "signal_id": signal_id, "path": path}
 
-    direction = str(live_candidate.get("direction") or "").upper()
-    if direction not in {"LONG", "SHORT"}:
+    internal_direction = str(live_candidate.get("direction") or "").upper()
+    if internal_direction not in {"LONG", "SHORT"}:
         return {"eligible": False, "sent": False, "status": "INVALID_DIRECTION", "signal_id": signal_id, "path": path}
+    executor_direction = {"LONG": "BUY", "SHORT": "SELL"}[internal_direction]
 
     payload = {
         "signal_id": signal_id,
-        "direction": direction,
+        "direction": executor_direction,
         "instrument": EXECUTOR_INSTRUMENT[market_key],
         "cohort": COHORT,
         "path": path,
         "entry": live_candidate.get("reference_price"),
         "signal_created_at": created_at,
-        "signal": f"{EXECUTOR_INSTRUMENT[market_key]} {direction.lower()} — {path}",
+        "signal": f"{EXECUTOR_INSTRUMENT[market_key]} {executor_direction.lower()} — {path}",
     }
     record = {
         "signal_id": signal_id, "market": market_key, "instrument": payload["instrument"],
         "path": path, "cohort": COHORT, "setup_key": stable_setup_key,
-        "live_gate": live_gate, "payload": payload, "attempted_at": _utcnow(),
+        "live_gate": live_gate, "internal_direction": internal_direction,
+        "payload": payload, "attempted_at": _utcnow(),
     }
     signals[signal_id] = record
     _write(_state_path(), state)
@@ -324,6 +344,8 @@ def record_callback(payload: dict) -> tuple[bool, str]:
         "broker_position_id", "instrument", "direction", "symbol", "actual_fill_price",
         "filled_lot", "strategy_capital_usd", "net_realized_pnl_usd",
         "net_realized_return_pct", "close_reason", "pilot_kind",
+        "reason", "reason_code", "error", "error_code", "error_message", "message",
+        "broker_error", "broker_error_code", "broker_error_message", "open_failure_reason",
     ):
         if payload.get(field) is not None:
             pos[field] = payload.get(field)
@@ -339,10 +361,11 @@ def record_callback(payload: dict) -> tuple[bool, str]:
     sig["last_sequence"] = sequence
     sig["lifecycle_state"] = pos["lifecycle_state"]
     sig["updated_at"] = _utcnow()
-    # Backward-compatible dashboard summary of the most recently updated position.
     for field in (
         "broker_position_id", "actual_fill_price", "net_realized_pnl_usd",
-        "instrument", "direction", "symbol", "close_reason",
+        "instrument", "direction", "symbol", "close_reason", "reason", "reason_code",
+        "error", "error_code", "error_message", "message", "broker_error",
+        "broker_error_code", "broker_error_message", "open_failure_reason",
     ):
         if pos.get(field) is not None:
             sig[field] = pos.get(field)
