@@ -87,6 +87,14 @@ jobs:
             reasons = th.get('open_failure_reasons') or {}
             print('COMPANION_OPEN_FAILURE_REASONS', reasons if reasons else 'NONE')
 
+            # UNSPECIFIED_OPEN_FAILURE means the OPEN_FAILED callback carried no
+            # readable reason. These are the field names those payloads DID have,
+            # which says whether the executor sends nothing or sends it under a
+            # key we do not read. Names only, no values.
+            unspecified_keys = th.get('unspecified_open_failure_keys') or []
+            print('COMPANION_UNSPECIFIED_FAILURE_KEYS',
+                  unspecified_keys if unspecified_keys else 'NONE_OR_NO_UNSPECIFIED_FAILURES')
+
             for key, market in sorted((health.get('markets') or {}).items()):
                 candidate = market.get('live_signal_candidate') or {}
                 delivery = market.get('tradehouse_delivery')

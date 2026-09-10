@@ -113,6 +113,14 @@ def delivery_snapshot() -> dict:
     failed_rows = [(sid, tid, pos) for sid, tid, pos in rows if pos.get("last_event") == "OPEN_FAILED"]
     failed_signal_ids = {sid for sid, _, _ in failed_rows}
     failure_reasons: dict[str, int] = {}
+    # When an OPEN_FAILED callback carries none of the eight reason fields below,
+    # the failure lands in UNSPECIFIED_OPEN_FAILURE and nobody can say why the
+    # position did not open. 129 of them had accumulated by 2026-09-10 with no
+    # way to tell whether the executor sends no reason at all, or sends one under
+    # a key this list does not read. Recording the KEY NAMES present on those
+    # payloads answers that without guessing. Names only, never values: these
+    # rows are executor data and may carry account or broker detail.
+    unspecified_keys: set[str] = set()
     for _, _, pos in failed_rows:
         reason = str(
             pos.get("reason_code")
@@ -125,6 +133,8 @@ def delivery_snapshot() -> dict:
             or pos.get("message")
             or "UNSPECIFIED_OPEN_FAILURE"
         )
+        if reason == "UNSPECIFIED_OPEN_FAILURE" and isinstance(pos, dict):
+            unspecified_keys.update(str(k) for k in pos)
         failure_reasons[reason] = failure_reasons.get(reason, 0) + 1
     # generated/sent/accepted count SIGNALS. opened/closed count POSITIONS, because
     # one signal fans out to many funded accounts. Mixing the two in one row is why
@@ -163,6 +173,8 @@ def delivery_snapshot() -> dict:
         "live_enable_requested": os.getenv("COMPANION_TRADEHOUSE_PILOT_ENABLED", "false").strip().lower() == "true",
         "summary": summary,
         "open_failure_reasons": dict(sorted(failure_reasons.items(), key=lambda kv: kv[1], reverse=True)),
+        # Field names seen on failures that carried no readable reason.
+        "unspecified_open_failure_keys": sorted(unspecified_keys),
         "signals": signals,
         "callbacks": callback_signals,
     }
