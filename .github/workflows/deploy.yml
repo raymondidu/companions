@@ -5,6 +5,10 @@ on:
     branches:
       - main
 
+permissions:
+  id-token: write
+  contents: read
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
@@ -13,11 +17,43 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v5
 
+      - name: Bootstrap TradeHouse credentials via GitHub OIDC
+        shell: bash
+        env:
+          BOOTSTRAP_URL: https://tradehouse.app/api/companion/bootstrap
+          OIDC_AUDIENCE: https://tradehouse.app/api/companion/bootstrap
+        run: |
+          set -euo pipefail
+
+          TOKEN_JSON="$(curl --fail-with-body --silent --show-error \
+            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${OIDC_AUDIENCE}")"
+          TOKEN="$(printf '%s' "$TOKEN_JSON" | jq -er '.value | select(type == "string" and length > 20)')"
+
+          RESP="$(curl --fail-with-body --silent --show-error \
+            -X POST "$BOOTSTRAP_URL" \
+            -H "Authorization: Bearer ${TOKEN}" \
+            -H 'Accept: application/json')"
+
+          EXECUTOR_SECRET="$(printf '%s' "$RESP" | jq -er '.executor_secret | select(type == "string" and length > 0)')"
+          CALLBACK_SECRET="$(printf '%s' "$RESP" | jq -er '.callback_secret | select(type == "string" and length > 0)')"
+
+          echo "::add-mask::${EXECUTOR_SECRET}"
+          echo "::add-mask::${CALLBACK_SECRET}"
+
+          {
+            printf 'COMPANION_EXECUTOR_SECRET=%s\n' "$EXECUTOR_SECRET"
+            printf 'COMPANION_CALLBACK_SECRET=%s\n' "$CALLBACK_SECRET"
+          } >> "$GITHUB_ENV"
+
+          unset TOKEN TOKEN_JSON RESP EXECUTOR_SECRET CALLBACK_SECRET
+          echo 'TradeHouse Companion credentials bootstrapped via GitHub OIDC.'
+
       - name: Deploy via SSH
         uses: appleboy/ssh-action@v1.2.0
         env:
-          COMPANION_EXECUTOR_SECRET: ${{ secrets.COMPANION_EXECUTOR_SECRET || secrets.TRADEHOUSE_EXECUTOR_SECRET || secrets.GOLD_EXECUTOR_SECRET || secrets.EXECUTOR_SECRET }}
-          COMPANION_CALLBACK_SECRET: ${{ secrets.COMPANION_CALLBACK_SECRET || secrets.EXECUTOR_CALLBACK_SECRET }}
+          COMPANION_EXECUTOR_SECRET: ${{ env.COMPANION_EXECUTOR_SECRET }}
+          COMPANION_CALLBACK_SECRET: ${{ env.COMPANION_CALLBACK_SECRET }}
         with:
           host: ${{ secrets.DO_HOST }}
           username: ${{ secrets.DO_USER }}
@@ -35,6 +71,11 @@ jobs:
             touch "$COMPANION_ENV"
             chmod 600 "$COMPANION_ENV"
 
+            if [ -z "${COMPANION_EXECUTOR_SECRET:-}" ] || [ -z "${COMPANION_CALLBACK_SECRET:-}" ]; then
+              echo 'OIDC bootstrap did not provide both Companion credentials; refusing deployment.' >&2
+              exit 1
+            fi
+
             tmp="$(mktemp)"
             grep -vE '^(COMPANION_EXECUTOR_BASE_URL|COMPANION_TRADEHOUSE_PILOT_ENABLED|COMPANION_EXECUTOR_SECRET|COMPANION_CALLBACK_SECRET|COMPANION_CALLBACK_HMAC_SECRET)=' "$COMPANION_ENV" > "$tmp" || true
             cat "$tmp" > "$COMPANION_ENV"
@@ -42,22 +83,11 @@ jobs:
 
             printf '%s\n' 'COMPANION_EXECUTOR_BASE_URL=https://tradehouse.app' >> "$COMPANION_ENV"
             printf '%s\n' 'COMPANION_TRADEHOUSE_PILOT_ENABLED=true' >> "$COMPANION_ENV"
+            printf 'COMPANION_EXECUTOR_SECRET=%s\n' "$COMPANION_EXECUTOR_SECRET" >> "$COMPANION_ENV"
+            printf 'COMPANION_CALLBACK_SECRET=%s\n' "$COMPANION_CALLBACK_SECRET" >> "$COMPANION_ENV"
+            chmod 600 "$COMPANION_ENV"
 
-            if [ -n "${COMPANION_EXECUTOR_SECRET:-}" ]; then
-              printf 'COMPANION_EXECUTOR_SECRET=%s\n' "$COMPANION_EXECUTOR_SECRET" >> "$COMPANION_ENV"
-            fi
-            if [ -n "${COMPANION_CALLBACK_SECRET:-}" ]; then
-              printf 'COMPANION_CALLBACK_SECRET=%s\n' "$COMPANION_CALLBACK_SECRET" >> "$COMPANION_ENV"
-            fi
-
-            if ! grep -qE '^COMPANION_EXECUTOR_SECRET=.+$' "$COMPANION_ENV" 2>/dev/null; then
-              echo 'Companion TradeHouse ingest credential is unavailable; refusing an unconfigured deployment.' >&2
-              exit 1
-            fi
-            if ! grep -qE '^COMPANION_CALLBACK_SECRET=.+$' "$COMPANION_ENV" 2>/dev/null; then
-              echo 'Companion callback credential is unavailable; refusing a deployment that cannot verify TradeHouse lifecycle callbacks.' >&2
-              exit 1
-            fi
+            unset COMPANION_EXECUTOR_SECRET COMPANION_CALLBACK_SECRET
 
             docker compose down --remove-orphans || true
             docker rm -f companions-companion-scanner-1 companions-companion-dashboard-1 2>/dev/null || true
@@ -72,5 +102,6 @@ jobs:
               fi
               sleep 3
             done
+
             printf '%s' "$HEALTH" | python3 -c 'import json,sys; d=json.load(sys.stdin); t=d.get("tradehouse") or {}; assert t.get("executor_configured") is True,d; assert t.get("live_enable_requested") is True,d'
             echo 'Companion deployment verified: TradeHouse transport configured, callback auth present, and pilot enabled.'
