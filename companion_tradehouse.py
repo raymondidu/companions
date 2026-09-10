@@ -121,6 +121,7 @@ def delivery_snapshot() -> dict:
     # payloads answers that without guessing. Names only, never values: these
     # rows are executor data and may carry account or broker detail.
     unspecified_keys: set[str] = set()
+    unspecified_event_keys: set[str] = set()
     for _, _, pos in failed_rows:
         reason = str(
             pos.get("reason_code")
@@ -135,6 +136,13 @@ def delivery_snapshot() -> dict:
         )
         if reason == "UNSPECIFIED_OPEN_FAILURE" and isinstance(pos, dict):
             unspecified_keys.update(str(k) for k in pos)
+            # The top level carries only identifiers and lifecycle state, so if a
+            # reason exists at all it is inside the per-event history. Record the
+            # field names on the OPEN_FAILED event itself: that is the difference
+            # between a one-line fix here and an ask to the executor.
+            for ev in (pos.get("events") or []):
+                if isinstance(ev, dict) and str(ev.get("event") or ev.get("type") or "").upper().endswith("OPEN_FAILED"):
+                    unspecified_event_keys.update(str(k) for k in ev)
         failure_reasons[reason] = failure_reasons.get(reason, 0) + 1
     # generated/sent/accepted count SIGNALS. opened/closed count POSITIONS, because
     # one signal fans out to many funded accounts. Mixing the two in one row is why
@@ -175,6 +183,7 @@ def delivery_snapshot() -> dict:
         "open_failure_reasons": dict(sorted(failure_reasons.items(), key=lambda kv: kv[1], reverse=True)),
         # Field names seen on failures that carried no readable reason.
         "unspecified_open_failure_keys": sorted(unspecified_keys),
+        "unspecified_open_failure_event_keys": sorted(unspecified_event_keys),
         "signals": signals,
         "callbacks": callback_signals,
     }

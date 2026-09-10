@@ -95,6 +95,14 @@ jobs:
             print('COMPANION_UNSPECIFIED_FAILURE_KEYS',
                   unspecified_keys if unspecified_keys else 'NONE_OR_NO_UNSPECIFIED_FAILURES')
 
+            # The top level carries only identifiers, so any reason lives on the
+            # OPEN_FAILED event itself. If a reason-shaped name appears here we
+            # read it and 129 unknowns resolve on our side; if nothing does, the
+            # executor genuinely sends no reason and the ask goes to them.
+            event_keys = th.get('unspecified_open_failure_event_keys') or []
+            print('COMPANION_UNSPECIFIED_EVENT_KEYS',
+                  event_keys if event_keys else 'NO_OPEN_FAILED_EVENT_DETAIL')
+
             for key, market in sorted((health.get('markets') or {}).items()):
                 candidate = market.get('live_signal_candidate') or {}
                 delivery = market.get('tradehouse_delivery')
