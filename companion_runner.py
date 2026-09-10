@@ -187,11 +187,13 @@ async def scan_one(key: str) -> dict:
                 learning.setdefault('observations',[]).append(
                     f"{gate} shadow edge ({tracked} tracked): avg MFE {stats.get('avg_mfe_capital_pct')}%, avg MAE {stats.get('avg_mae_capital_pct')}%; reached +5% {stats.get('reached_5pct',0)}, +7.5% {stats.get('reached_7.5pct',0)}, +10% {stats.get('reached_10pct',0)}."
                 )
-                h1=(stats.get('horizons') or {}).get('1h') or {}
-                h4=(stats.get('horizons') or {}).get('4h') or {}
-                h12=(stats.get('horizons') or {}).get('12h') or {}
+                # Distinct names: h1/h4 above are the H1/H4 candle frames and must
+                # not be shadowed -- out['data'] reports len(h1)/len(h4) later.
+                hz1=(stats.get('horizons') or {}).get('1h') or {}
+                hz4=(stats.get('horizons') or {}).get('4h') or {}
+                hz12=(stats.get('horizons') or {}).get('12h') or {}
                 horizon_bits=[]
-                for label,h in [('1h',h1),('4h',h4),('12h',h12)]:
+                for label,h in [('1h',hz1),('4h',hz4),('12h',hz12)]:
                     if int(h.get('samples') or 0)>0:
                         horizon_bits.append(f"{label}: {h['samples']} samples, avg {h.get('avg_capital_return_pct')}%, positive {h.get('positive_rate_pct')}%")
                 if horizon_bits:
