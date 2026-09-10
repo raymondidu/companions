@@ -19,7 +19,7 @@ Companion decides only:
 
 - whether a fresh qualifying trade exists;
 - instrument;
-- internal strategy direction (`LONG` or `SHORT`);
+- strategy direction (`LONG` or `SHORT`);
 - current executable/reference market price at signal creation;
 - signal creation timestamp;
 - stable signal id;
@@ -31,12 +31,12 @@ Companion must never instruct TradeHouse to use a fixed dollar amount, fixed wal
 
 ## 3. Live transport payload
 
-The strategy engine may reason internally in `LONG` / `SHORT`, but the current TradeHouse Companion ingest contract requires execution directions `BUY` / `SELL` at the transport boundary:
+The current TradeHouse Companion ingest contract requires `LONG` / `SHORT` exactly. Do not translate these values to `BUY` / `SELL`.
 
 ```json
 {
   "signal_id": "OIL-or-BTC-stable-id",
-  "direction": "BUY",
+  "direction": "LONG",
   "instrument": "USOIL",
   "cohort": "EXNESS_SURVIVAL_V1",
   "path": "BALANCED_CLEAN",
@@ -44,11 +44,6 @@ The strategy engine may reason internally in `LONG` / `SHORT`, but the current T
   "signal_created_at": "UTC ISO-8601 timestamp"
 }
 ```
-
-Mapping:
-
-- internal `LONG` -> executor `BUY`
-- internal `SHORT` -> executor `SELL`
 
 For BTC, `instrument` is `BTCUSD` and the active path is `GOLD_M30_LOCAL_STRUCTURE`.
 
