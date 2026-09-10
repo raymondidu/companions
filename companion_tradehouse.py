@@ -216,7 +216,10 @@ async def deliver_selected_signal(
     internal_direction = str(live_candidate.get("direction") or "").upper()
     if internal_direction not in {"LONG", "SHORT"}:
         return {"eligible": False, "sent": False, "status": "INVALID_DIRECTION", "signal_id": signal_id, "path": path}
-    executor_direction = {"LONG": "BUY", "SHORT": "SELL"}[internal_direction]
+
+    # TradeHouse Companion ingest contract requires LONG/SHORT exactly.
+    # Keep internal strategy semantics unchanged and send them through verbatim.
+    executor_direction = internal_direction
 
     payload = {
         "signal_id": signal_id,
