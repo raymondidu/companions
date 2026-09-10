@@ -13,6 +13,7 @@ from companion_exness_specs import CATALOG_SOURCE, CATALOG_VERIFIED_AT, validate
 from companion_tournament import PROFILES, Tournament, evaluate_profile
 from companion_tradehouse import ACTIVE_PATHS, deliver_selected_signal
 from companion_learning import build_learning_report
+from companion_counterfactual import infer_direction, update_counterfactuals
 from market_data import BinanceBreadthData, CoinbaseData, OandaData
 
 DATA_DIR = Path(os.getenv('COMPANION_DATA_DIR', '/app/companion-data'))
@@ -143,9 +144,21 @@ async def scan_one(key: str) -> dict:
         if live_profile is not None:
             candidate,live_gate=evaluate_profile(cfg,live_profile,m15,h1,h4,q.bid,q.ask,context)
             live_candidate=vars(candidate) if candidate is not None else None
+        setup_key=_setup_key(m15)
         delivery=await deliver_selected_signal(
             key, profiles, live_candidate=live_candidate,
-            setup_key=_setup_key(m15), live_gate=live_gate,
+            setup_key=setup_key, live_gate=live_gate,
+        )
+
+        live_path=ACTIVE_PATHS.get(key)
+        champion_row=next((r for r in ranking if r.get('profile')==live_path),None)
+        if champion_row is not None and not champion_row.get('contract_size'):
+            champion_row=dict(champion_row)
+            champion_row['contract_size']=out['exness_tradability'].get('contract_size')
+        shadow_direction=(live_candidate or {}).get('direction') if live_candidate else infer_direction(m15,h1,h4)
+        counterfactual=update_counterfactuals(
+            DATA_DIR,key,setup_key,live_gate,shadow_direction,
+            q.bid,q.ask,champion_row,SCAN_COUNTS[key],
         )
 
         learning=build_learning_report(
@@ -157,6 +170,23 @@ async def scan_one(key: str) -> dict:
             context,
             SCAN_COUNTS[key],
         )
+        learning['counterfactual']=counterfactual
+        if counterfactual.get('resolved_shadows'):
+            protected=int(counterfactual.get('protected_losers') or 0)
+            blocked=int(counterfactual.get('blocked_winners') or 0)
+            learning.setdefault('observations',[]).append(
+                f"Rejected-signal shadows resolved: {protected} protected losers, {blocked} blocked +15% opportunities."
+            )
+            for gate,stats in (counterfactual.get('by_gate') or {}).items():
+                decisive=int(stats.get('protected_losers') or 0)+int(stats.get('blocked_winners') or 0)
+                if decisive>=20 and (stats.get('blocked_winner_rate_pct') or 0)>=60:
+                    learning.setdefault('recommended_actions',[]).append(
+                        f"{gate} blocked profitable shadows {stats['blocked_winner_rate_pct']}% of decisive cases ({decisive} sample); investigate a paper-only challenger with a controlled relaxation, not a live gate change."
+                    )
+                if decisive>=20 and (stats.get('protect_rate_pct') or 0)>=70:
+                    learning.setdefault('observations',[]).append(
+                        f"{gate} is currently protective: {stats['protect_rate_pct']}% of decisive shadow outcomes reached -10% adverse before +15%."
+                    )
 
         out.update(
             ok=True,state='RUNNING',
@@ -169,6 +199,7 @@ async def scan_one(key: str) -> dict:
             live_signal_candidate=live_candidate,
             live_signal_gate=live_gate,
             tradehouse_delivery=delivery,
+            counterfactual=counterfactual,
             learning=learning,
             promotion_policy={
                 'minimum_rank_sample':30,
