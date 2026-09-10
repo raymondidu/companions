@@ -12,6 +12,7 @@ from companion_markets import MARKETS
 from companion_exness_specs import CATALOG_SOURCE, CATALOG_VERIFIED_AT, validate_market_mapping
 from companion_tournament import PROFILES, Tournament, evaluate_profile
 from companion_tradehouse import ACTIVE_PATHS, deliver_selected_signal
+from companion_learning import build_learning_report
 from market_data import BinanceBreadthData, CoinbaseData, OandaData
 
 DATA_DIR = Path(os.getenv('COMPANION_DATA_DIR', '/app/companion-data'))
@@ -147,6 +148,16 @@ async def scan_one(key: str) -> dict:
             setup_key=_setup_key(m15), live_gate=live_gate,
         )
 
+        learning=build_learning_report(
+            DATA_DIR,
+            key,
+            ranking,
+            live_gate,
+            delivery,
+            context,
+            SCAN_COUNTS[key],
+        )
+
         out.update(
             ok=True,state='RUNNING',
             quote={'bid':q.bid,'ask':q.ask,'time':q.time},
@@ -158,6 +169,7 @@ async def scan_one(key: str) -> dict:
             live_signal_candidate=live_candidate,
             live_signal_gate=live_gate,
             tradehouse_delivery=delivery,
+            learning=learning,
             promotion_policy={
                 'minimum_rank_sample':30,
                 'minimum_resolved_trades_for_ranking':30,
