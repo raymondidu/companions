@@ -99,6 +99,7 @@ def update_counterfactuals(
     ask: float,
     champion_row: dict | None,
     scan_count: int,
+    regime: str | None = None,
 ) -> dict:
     rows = _load(data_dir, market)
     now = _utcnow()
@@ -150,6 +151,7 @@ def update_counterfactuals(
             'shadow_key': key,
             'market': market,
             'gate': gate,
+            'regime': str(regime or ('NON_CRYPTO_BASELINE' if market != 'BTC' else 'BTC_REGIME_UNKNOWN')),
             'direction': direction,
             'entry': entry,
             'created_at': now,
