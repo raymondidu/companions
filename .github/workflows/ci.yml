@@ -22,8 +22,13 @@ jobs:
           python -m pytest -q \
             tests/test_companion_market_isolation.py \
             tests/test_companion_tournament.py \
-            tests/test_companion_runner_scan_truth.py
-      - name: Static live-authority guard
+            tests/test_companion_runner_scan_truth.py \
+            tests/test_companion_live_routing_contract.py
+      # NOTE: this step only checks constants in companion_markets.isolation_contract().
+      # It is NOT a routing guard and will pass even if SILVER is added to
+      # ACTIVE_PATHS. What may actually reach TradeHouse is asserted by
+      # tests/test_companion_live_routing_contract.py above.
+      - name: Static isolation-contract fields (not a routing guard)
         run: |
           python - <<'PY'
           from companion_markets import isolation_contract
