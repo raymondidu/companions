@@ -14,6 +14,7 @@ from companion_tournament import PROFILES, Tournament, evaluate_profile
 from companion_tradehouse import ACTIVE_PATHS, deliver_selected_signal
 from companion_learning import build_learning_report
 from companion_counterfactual import infer_direction, update_counterfactuals
+from companion_regime_learning import build_regime_report
 from market_data import BinanceBreadthData, CoinbaseData, OandaData
 
 DATA_DIR = Path(os.getenv('COMPANION_DATA_DIR', '/app/companion-data'))
@@ -156,9 +157,10 @@ async def scan_one(key: str) -> dict:
             champion_row=dict(champion_row)
             champion_row['contract_size']=out['exness_tradability'].get('contract_size')
         shadow_direction=(live_candidate or {}).get('direction') if live_candidate else infer_direction(m15,h1,h4)
+        regime=(context.get('crypto_breadth') or {}).get('state') if key=='BTC' else 'NON_CRYPTO_BASELINE'
         counterfactual=update_counterfactuals(
             DATA_DIR,key,setup_key,live_gate,shadow_direction,
-            q.bid,q.ask,champion_row,SCAN_COUNTS[key],
+            q.bid,q.ask,champion_row,SCAN_COUNTS[key],regime,
         )
 
         learning=build_learning_report(
@@ -188,6 +190,11 @@ async def scan_one(key: str) -> dict:
                         f"{gate} is currently protective: {stats['protect_rate_pct']}% of decisive shadow outcomes reached -10% adverse before +15%."
                     )
 
+        regime_learning=build_regime_report(DATA_DIR,key)
+        learning['regime_learning']=regime_learning
+        learning.setdefault('observations',[]).extend(regime_learning.get('observations') or [])
+        learning.setdefault('recommended_actions',[]).extend(regime_learning.get('recommended_actions') or [])
+
         out.update(
             ok=True,state='RUNNING',
             quote={'bid':q.bid,'ask':q.ask,'time':q.time},
@@ -201,6 +208,7 @@ async def scan_one(key: str) -> dict:
             tradehouse_delivery=delivery,
             counterfactual=counterfactual,
             learning=learning,
+            regime_learning=regime_learning,
             promotion_policy={
                 'minimum_rank_sample':30,
                 'minimum_resolved_trades_for_ranking':30,
