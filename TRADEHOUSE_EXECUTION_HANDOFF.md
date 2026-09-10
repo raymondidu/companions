@@ -19,33 +19,24 @@ Companion decides only:
 
 - whether a fresh qualifying trade exists;
 - instrument;
-- direction (`LONG` or `SHORT`);
+- internal strategy direction (`LONG` or `SHORT`);
 - current executable/reference market price at signal creation;
 - signal creation timestamp;
 - stable signal id;
 - selected prediction path/cohort metadata.
 
-TradeHouse owns all execution decisions tied to the user account, including:
-
-- user capital;
-- position sizing;
-- lot size;
-- leverage/margin;
-- broker/account selection;
-- order placement;
-- trailing/protection;
-- closing and realized P&L.
+TradeHouse owns all execution decisions tied to the user account, including user capital, position sizing, lot size, leverage/margin, broker/account selection, order placement, trailing/protection, closing and realized P&L.
 
 Companion must never instruct TradeHouse to use a fixed dollar amount, fixed wallet size, fixed lot size, or fixed leverage. Paper-tournament sizing exists only to compare prediction paths consistently and must not cross the live transport boundary.
 
 ## 3. Live transport payload
 
-A live Companion signal must be minimal and equivalent to the Gold architecture:
+The strategy engine may reason internally in `LONG` / `SHORT`, but the current TradeHouse Companion ingest contract requires execution directions `BUY` / `SELL` at the transport boundary:
 
 ```json
 {
   "signal_id": "OIL-or-BTC-stable-id",
-  "direction": "LONG",
+  "direction": "BUY",
   "instrument": "USOIL",
   "cohort": "EXNESS_SURVIVAL_V1",
   "path": "BALANCED_CLEAN",
@@ -53,6 +44,11 @@ A live Companion signal must be minimal and equivalent to the Gold architecture:
   "signal_created_at": "UTC ISO-8601 timestamp"
 }
 ```
+
+Mapping:
+
+- internal `LONG` -> executor `BUY`
+- internal `SHORT` -> executor `SELL`
 
 For BTC, `instrument` is `BTCUSD` and the active path is `GOLD_M30_LOCAL_STRUCTURE`.
 
@@ -93,6 +89,7 @@ POST https://companion.tradehouseapp.com/api/companion/callback
 
 Callbacks must be HMAC authenticated and sequenced. Supported lifecycle events include:
 
+- `ACCEPTED`
 - `RECEIVED`
 - `OPENING`
 - `OPENED`
@@ -105,7 +102,7 @@ Callbacks must be HMAC authenticated and sequenced. Supported lifecycle events i
 - `POSITION_LOST`
 - `RECOVERED_AFTER_RESTART`
 
-`OPENED` must include `broker_position_id`. `CLOSED` must include the broker-authoritative realized result when available.
+`OPENED` must include `broker_position_id`. `CLOSED` must include the broker-authoritative realized result when available. `OPEN_FAILED` details should be preserved so the dashboard can show the broker failure reason and distinguish failed fan-out account opens from failed prediction signals.
 
 ## 7. Prediction-path policy
 
@@ -141,6 +138,7 @@ The dashboard must distinguish these stages:
 - `Accepted`: TradeHouse acknowledged acceptance;
 - `Opened`: TradeHouse callback confirmed a broker position id;
 - `Closed`: TradeHouse callback confirmed closure;
-- `Open failed`: TradeHouse explicitly reported opening failure.
+- `Failed signals`: number of distinct signals with at least one failed fan-out broker open;
+- `Failed account opens`: number of individual TradeHouse account positions that reported `OPEN_FAILED`.
 
 A paper trade is not a TradeHouse trade. HTTP acceptance is not a broker fill. Only callback-confirmed broker lifecycle data is live execution truth.
