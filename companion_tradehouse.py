@@ -122,6 +122,7 @@ def delivery_snapshot() -> dict:
     # rows are executor data and may carry account or broker detail.
     unspecified_keys: set[str] = set()
     unspecified_event_keys: set[str] = set()
+    unspecified_event_counts: list[int] = []
     for _, _, pos in failed_rows:
         reason = str(
             pos.get("reason_code")
@@ -140,8 +141,14 @@ def delivery_snapshot() -> dict:
             # reason exists at all it is inside the per-event history. Record the
             # field names on the OPEN_FAILED event itself: that is the difference
             # between a one-line fix here and an ask to the executor.
-            for ev in (pos.get("events") or []):
-                if isinstance(ev, dict) and str(ev.get("event") or ev.get("type") or "").upper().endswith("OPEN_FAILED"):
+            # Every event, not just ones matching a guessed event-name key: the
+            # first pass filtered on ev['event'] / ev['type'] and returned
+            # nothing, which cannot distinguish "no events" from "my guess at
+            # the key was wrong". Counting them separates those two.
+            evs = pos.get("events") or []
+            unspecified_event_counts.append(len(evs) if isinstance(evs, list) else -1)
+            for ev in (evs if isinstance(evs, list) else []):
+                if isinstance(ev, dict):
                     unspecified_event_keys.update(str(k) for k in ev)
         failure_reasons[reason] = failure_reasons.get(reason, 0) + 1
     # generated/sent/accepted count SIGNALS. opened/closed count POSITIONS, because
@@ -184,6 +191,8 @@ def delivery_snapshot() -> dict:
         # Field names seen on failures that carried no readable reason.
         "unspecified_open_failure_keys": sorted(unspecified_keys),
         "unspecified_open_failure_event_keys": sorted(unspecified_event_keys),
+        "unspecified_open_failure_event_count_max": max(unspecified_event_counts, default=0),
+        "unspecified_open_failure_rows_with_events": sum(1 for n in unspecified_event_counts if n > 0),
         "signals": signals,
         "callbacks": callback_signals,
     }
