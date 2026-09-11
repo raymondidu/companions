@@ -43,10 +43,16 @@ permissions:
 jobs:
   assert:
     runs-on: ubuntu-latest
-    timeout-minutes: 6
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
+      # Timeouts are deliberately generous. On 2026-09-11 at 18:42 a plain
+      # `docker ps` on this host took 2m23s and the whole telemetry read took
+      # 2m58s against a usual 7s. A health check that times out on a slow host
+      # reports a system fault that is really just latency, which is exactly
+      # the kind of false signal this workflow exists to stop producing.
+      #
       # Plain ssh rather than appleboy/ssh-action, deliberately: this step
       # needs the payload as DATA on the runner, and that action streams
       # remote stdout to the job log where a later step cannot read it.
@@ -63,9 +69,9 @@ jobs:
           chmod 600 ~/.ssh/companion_key
           ssh-keyscan -H "$DO_HOST" >> ~/.ssh/known_hosts 2>/dev/null
           ssh -i ~/.ssh/companion_key \
-              -o StrictHostKeyChecking=yes -o ConnectTimeout=20 \
+              -o StrictHostKeyChecking=yes -o ConnectTimeout=30 \
               "$DO_USER@$DO_HOST" \
-              'curl --connect-timeout 5 --max-time 25 -fsS http://127.0.0.1:8082/health' \
+              'curl --connect-timeout 10 --max-time 120 -fsS http://127.0.0.1:8082/health' \
               > current_health.json
           # Fail here, loudly, rather than letting an empty or truncated body
           # reach the assertion step and be judged as a system fault.
