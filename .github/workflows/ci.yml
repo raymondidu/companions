@@ -17,18 +17,25 @@ jobs:
           python-version: '3.12'
       - run: python -m pip install -r requirements.txt
       - run: python -m compileall -q companion_*.py market_data.py
-      - name: Prove companion isolation and tournament contracts
-        run: |
-          python -m pytest -q \
-            tests/test_companion_market_isolation.py \
-            tests/test_companion_tournament.py \
-            tests/test_companion_runner_scan_truth.py \
-            tests/test_companion_live_routing_contract.py \
-            tests/test_companion_counting_basis.py
+      # RUN THE WHOLE DIRECTORY, never a hand-maintained list.
+      #
+      # This step used to name five files. tests/test_companion_health_assert.py
+      # was not among them, so the 23 tests guarding the health assertions --
+      # the ones written specifically to catch the frozen opened_signals counter
+      # of 2026-09-11 -- had never executed in CI once. They existed in the repo
+      # and protected nothing, and nothing would have said so until the next
+      # regression walked through the gap.
+      #
+      # A list has to be remembered. A directory does not. Every test file added
+      # from here runs automatically, which is the only version of this that
+      # stays true without anyone maintaining it.
+      - name: Prove companion isolation, tournament and health contracts
+        run: python -m pytest -q tests
       # NOTE: this step only checks constants in companion_markets.isolation_contract().
       # It is NOT a routing guard and will pass even if SILVER is added to
-      # ACTIVE_PATHS. What may actually reach TradeHouse is asserted by
-      # tests/test_companion_live_routing_contract.py above.
+      # ACTIVE_PATHS. What may actually reach TradeHouse is asserted by the
+      # live routing contract test, which the step above now runs as part of
+      # the whole directory.
       - name: Static isolation-contract fields (not a routing guard)
         run: |
           python - <<'PY'

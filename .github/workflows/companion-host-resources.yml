@@ -23,10 +23,37 @@ name: Companion Host Resources
 # Read-only over SSH. Touches nothing on the host: no deploy, no restart,
 # no container, no gate, no threshold, no strategy.
 
+# WHY THIS ALSO CHAINS OFF companion-telemetry.yml
+#
+# This workflow was added to main at 19:01 UTC on 2026-09-11 with a cron of
+# its own. Five scheduled slots passed -- 19:08, 19:38, 20:08, 20:38, 21:08 --
+# and GitHub fired NONE of them. companion-host-resources.yml, added in the
+# same commit with its own cron, had not run a single time either. Meanwhile
+# companion-telemetry.yml, whose schedule predates both, fired reliably
+# throughout on '3,18,33,48'.
+#
+# GitHub documents `schedule` as best-effort: runs are delayed under load and
+# can be dropped entirely. A newly registered cron appears to be the weakest
+# case of all. That is survivable for a workflow that prints state. It is not
+# survivable for the one workflow whose entire job is to notice that a counter
+# stopped moving -- a monitor that silently never runs is worse than no
+# monitor, because it reports nothing and everyone reads that as nothing wrong.
+# Exactly that happened on 2026-09-11: opened_signals sat frozen for twelve
+# hours and every check said healthy.
+#
+# So this no longer depends on its own cron alone. It runs after every
+# companion-telemetry run, which is a schedule GitHub has actually been
+# honouring, and keeps its own cron and workflow_dispatch as extra chances to
+# fire. The concurrency group already serialises overlapping runs, and a
+# duplicate reading is harmless: the assertions compare against the previous
+# reading whenever it came from.
 on:
   schedule:
     - cron: '13,43 * * * *'
   workflow_dispatch:
+  workflow_run:
+    workflows: ["Companion Production Telemetry"]
+    types: [completed]
 
 concurrency:
   group: companion-host-resources
