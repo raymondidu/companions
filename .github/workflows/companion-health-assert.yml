@@ -1,0 +1,133 @@
+name: Companion Health Assertions
+
+# Judges companion health by comparing this reading to the previous one.
+#
+# WHY THIS IS SEPARATE FROM companion-telemetry.yml
+#
+# That workflow prints state. This one has an opinion about it. On
+# 2026-09-11 the analyzer generated 56 signals and opened none of them for
+# twelve hours while every telemetry read looked perfectly normal, because
+# every read was a snapshot and the fault was a trend. Printing more state
+# would not have caught it. Comparing two readings does.
+#
+# TWO RULES THIS WORKFLOW IS BUILT ON
+#
+#   Alarm on edges, report on levels. It goes red the pass a fault APPEARS.
+#   While a fault persists it is carried in the state file with a duration
+#   and does not re-alarm. The Gold watchdog workflow spent 21 hours red on
+#   one unchanging condition and everyone stopped reading it, which is how
+#   a real fault stayed invisible all night. An alarm that can be red for
+#   21 hours is not an alarm.
+#
+#   The remote host does the dumbest possible thing. It runs one curl. All
+#   judgement lives in .github/scripts/companion_health_assert.py, which is
+#   unit-tested against real production payloads. A badly indented Python
+#   heredoc inside an SSH block silently killed an entire in-container read
+#   once already, and the workflow reported success while doing it.
+#
+# Read-only against production. No deploy, no restart, no container, no
+# gate, no threshold, no strategy. It writes only to the telemetry branch.
+
+on:
+  schedule:
+    - cron: '8,38 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: companion-health-assert
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  assert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v4
+
+      # Plain ssh rather than appleboy/ssh-action, deliberately: this step
+      # needs the payload as DATA on the runner, and that action streams
+      # remote stdout to the job log where a later step cannot read it.
+      # The remote command is one curl and nothing else.
+      - name: Read companion health from production
+        env:
+          DO_HOST: ${{ secrets.DO_HOST }}
+          DO_USER: ${{ secrets.DO_USER }}
+          DO_SSH_KEY: ${{ secrets.DO_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DO_SSH_KEY" > ~/.ssh/companion_key
+          chmod 600 ~/.ssh/companion_key
+          ssh-keyscan -H "$DO_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          ssh -i ~/.ssh/companion_key \
+              -o StrictHostKeyChecking=yes -o ConnectTimeout=20 \
+              "$DO_USER@$DO_HOST" \
+              'curl --connect-timeout 5 --max-time 25 -fsS http://127.0.0.1:8082/health' \
+              > current_health.json
+          # Fail here, loudly, rather than letting an empty or truncated body
+          # reach the assertion step and be judged as a system fault.
+          python3 -c "import json,sys; d=json.load(open('current_health.json')); sys.exit(0 if isinstance(d,dict) and d else 1)"
+          echo "health payload read, $(wc -c < current_health.json) bytes"
+
+      - name: Fetch the previous reading
+        run: |
+          set -uo pipefail
+          if git fetch origin telemetry --depth=1 2>/dev/null \
+             && git show FETCH_HEAD:telemetry/companion-health-state.json > previous.json 2>/dev/null; then
+            echo "previous reading found"
+          else
+            rm -f previous.json
+            echo "no previous reading; this pass establishes the baseline"
+          fi
+
+      - name: Assert against the previous reading
+        id: assert
+        run: |
+          set -uo pipefail
+          PREV=previous.json
+          [ -f "$PREV" ] || PREV=NONE
+          python3 .github/scripts/companion_health_assert.py \
+            current_health.json "$PREV" new-state.json
+          rc=$?
+          # Exit with the script's own code. Ending this step on an echo
+          # would make it always succeed, and the alarm would be dead
+          # while looking perfectly wired up.
+          exit $rc
+        continue-on-error: true
+
+      # The state file is published whatever the verdict. An unhealthy
+      # production state must make this workflow fail, but it must never
+      # stop the evidence for that failure being recorded.
+      - name: Publish the reading
+        if: always()
+        run: |
+          set -euo pipefail
+          [ -f new-state.json ] || { echo "no state produced"; exit 0; }
+          git config user.name "companion-health-assert"
+          git config user.email "noreply@anthropic.com"
+          if git fetch origin telemetry --depth=1 2>/dev/null; then
+            git checkout -q -B telemetry FETCH_HEAD
+          else
+            git checkout -q --orphan telemetry
+            # An orphan checkout keeps the whole working tree staged; the
+            # telemetry branch must carry readings and nothing else.
+            git rm -rq --cached . 2>/dev/null || true
+          fi
+          mkdir -p telemetry
+          cp new-state.json telemetry/companion-health-state.json
+          git add telemetry/companion-health-state.json
+          git commit -q -m "Companion health reading $(date -u +%FT%TZ)" || echo "no change"
+          git push -q origin HEAD:telemetry
+
+      - name: Fail the run if a new fault appeared
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.assert.outcome }}" != "success" ]; then
+            echo "A NEW companion fault appeared this pass. See the assertion step."
+            exit 1
+          fi
+          echo "No new faults."
