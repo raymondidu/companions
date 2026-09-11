@@ -58,6 +58,7 @@ jobs:
       # remote stdout to the job log where a later step cannot read it.
       # The remote command is one curl and nothing else.
       - name: Read companion health from production
+        id: read
         env:
           DO_HOST: ${{ secrets.DO_HOST }}
           DO_USER: ${{ secrets.DO_USER }}
@@ -67,12 +68,29 @@ jobs:
           install -m 700 -d ~/.ssh
           printf '%s\n' "$DO_SSH_KEY" > ~/.ssh/companion_key
           chmod 600 ~/.ssh/companion_key
-          ssh-keyscan -H "$DO_HOST" >> ~/.ssh/known_hosts 2>/dev/null
-          ssh -i ~/.ssh/companion_key \
-              -o StrictHostKeyChecking=yes -o ConnectTimeout=30 \
-              "$DO_USER@$DO_HOST" \
-              'curl --connect-timeout 10 --max-time 120 -fsS http://127.0.0.1:8082/health' \
-              > current_health.json
+          ssh-keyscan -T 30 -H "$DO_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
+          # ConnectTimeout was 30s and the host timed out at 19:41 while
+          # appleboy/ssh-action, which uses 45s, connected fine minutes
+          # either side. This box is slow to ACCEPT under load, not
+          # unreachable, so a short connect timeout manufactures an outage.
+          # Three attempts with backoff, 60s each.
+          ok=0
+          for attempt in 1 2 3; do
+            if ssh -i ~/.ssh/companion_key \
+                -o StrictHostKeyChecking=yes -o ConnectTimeout=60 \
+                -o ServerAliveInterval=15 -o ServerAliveCountMax=8 \
+                "$DO_USER@$DO_HOST" \
+                'curl --connect-timeout 10 --max-time 120 -fsS http://127.0.0.1:8082/health' \
+                > current_health.json; then
+              ok=1; break
+            fi
+            echo "ssh attempt $attempt failed; retrying"
+            sleep $((attempt * 10))
+          done
+          if [ "$ok" != "1" ]; then
+            echo "COMPANION_PROBE_UNREACHABLE could not read /health after 3 attempts"
+            exit 1
+          fi
           # Fail here, loudly, rather than letting an empty or truncated body
           # reach the assertion step and be judged as a system fault.
           python3 -c "import json,sys; d=json.load(open('current_health.json')); sys.exit(0 if isinstance(d,dict) and d else 1)"
@@ -128,12 +146,31 @@ jobs:
           git commit -q -m "Companion health reading $(date -u +%FT%TZ)" || echo "no change"
           git push -q origin HEAD:telemetry
 
-      - name: Fail the run if a new fault appeared
+      # A PROBE FAILURE IS NOT A COMPANION FAULT.
+      #
+      # On this workflow's first live run the ssh connect timed out and the
+      # run announced "A NEW companion fault appeared this pass". Nothing
+      # was wrong with companions. That is exactly the false signal this
+      # workflow exists to stop producing, shipped inside the tool meant to
+      # prevent it. The two outcomes are now named separately: an
+      # unreadable system is reported as unreadable, never as a fault.
+      #
+      # Both still fail the run, because absence of evidence degrades and a
+      # probe we cannot run is not a system we can call healthy. Only the
+      # wording and the cause differ, and the cause is what someone acts on.
+      - name: Report the outcome
         if: always()
         run: |
           set -euo pipefail
-          if [ "${{ steps.assert.outcome }}" != "success" ]; then
-            echo "A NEW companion fault appeared this pass. See the assertion step."
+          if [ "${{ steps.read.outcome }}" != "success" ]; then
+            echo "COMPANION_PROBE_FAILED could not read production health."
+            echo "  This says nothing about companion health. The probe did not run."
+            echo "  Check the read step: ssh reachability, then /health latency."
             exit 1
           fi
-          echo "No new faults."
+          if [ "${{ steps.assert.outcome }}" != "success" ]; then
+            echo "COMPANION_FAULT_NEW a new companion fault appeared this pass."
+            echo "  See the assertion step for the code and detail."
+            exit 1
+          fi
+          echo "COMPANION_HEALTH_OK no new faults."
