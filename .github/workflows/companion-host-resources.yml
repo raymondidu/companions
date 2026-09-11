@@ -1,0 +1,155 @@
+name: Companion Host Resources
+
+# Measures the companion production host and says whether it is off its
+# ceiling.
+#
+# WHY THIS DID NOT EXIST UNTIL NOW
+#
+# On 2026-09-11 at 18:42 this host degraded badly: all three markets went
+# SCANNER_STALE with heartbeats of 214-285s, service.ok flipped to False,
+# two qualified signals were lost to DELIVERY_ERROR, and a plain
+# `docker ps` took 2m23s against a usual instant. The telemetry read took
+# 2m58s against a usual 7s.
+#
+# And nothing in this repository could say whether that was memory, CPU,
+# disk or the network, because nothing had ever measured the host. The
+# Gold repo learned this lesson the hard way and has gold-host-resources;
+# companions had no equivalent, so every diagnosis here was a guess.
+#
+# Owner instruction, 2026-09-11: processes must keep running and must not
+# max the server out. That instruction is unenforceable on a box nobody
+# measures, so this measures it.
+#
+# Read-only over SSH. Touches nothing on the host: no deploy, no restart,
+# no container, no gate, no threshold, no strategy.
+
+on:
+  schedule:
+    - cron: '13,43 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: companion-host-resources
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  resources:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Measure the companion production host
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.DO_HOST }}
+          username: ${{ secrets.DO_USER }}
+          key: ${{ secrets.DO_SSH_KEY }}
+          port: 22
+          timeout: 45s
+          # Generous on purpose. A docker ps on this host took 2m23s on
+          # 2026-09-11; a probe that times out during pressure tells you
+          # nothing at exactly the moment you need it most.
+          command_timeout: 8m
+          script: |
+            set -uo pipefail
+            cd /home/companions 2>/dev/null || cd /
+
+            echo "COMPANION_HOST_MEMORY"
+            free -m || true
+
+            echo "COMPANION_HOST_LOAD $(cat /proc/loadavg 2>/dev/null || echo unavailable)"
+            echo "COMPANION_HOST_DISK"
+            df -h / 2>/dev/null | tail -2 || true
+
+            echo "COMPANION_CONTAINER_STATS"
+            docker stats --no-stream --format \
+              'COMPANION_CONTAINER {{.Name}} mem={{.MemUsage}} pct={{.MemPerc}} cpu={{.CPUPerc}}' || true
+
+            echo "COMPANION_CONTAINER_STATE"
+            docker ps --format 'COMPANION_PS {{.Names}} {{.Status}}' || true
+
+            # An OOM kill is the difference between "it was slow" and "the
+            # kernel shot it". Gold's dashboard was killed this way at
+            # 15:50:03 and without dmesg that would have stayed a theory.
+            echo "COMPANION_OOM_RECENT"
+            (dmesg -T 2>/dev/null | grep -iE 'out of memory|oom-kill|killed process' | tail -15) \
+              || echo "COMPANION_OOM_RECENT NONE_OR_DMESG_UNREADABLE"
+
+            echo "COMPANION_RESTART_COUNTS"
+            for c in $(docker ps -a --format '{{.Names}}' | grep '^companion-' || true); do
+              echo "COMPANION_RESTARTS $c $(docker inspect -f '{{.RestartCount}}' "$c" 2>/dev/null || echo '?')"
+            done
+
+            # A stale scanner and a crashed scanner look identical from
+            # outside the container. Its own tail is the only thing that says
+            # which, and the rare lines are the ones that matter.
+            echo "COMPANION_SCANNER_EVENTS"
+            docker logs --tail 4000 companion-scanner 2>&1 \
+              | grep -aiE 'Traceback|CRITICAL|ERROR|SCANNER_STALE|DELIVERY_ERROR|database is locked|restart' \
+              | tail -25 | sed "s/^/COMPANION_EVENT /" || echo "COMPANION_EVENT NONE_IN_WINDOW"
+
+            python3 - <<'PYGUARD'
+            # Same thresholds and the same reasoning as the Gold guard, so the
+            # two hosts are judged by one standard. 80% is where headroom stops
+            # absorbing a spike; 90% is where a kill is imminent rather than
+            # possible, so that is the line that fails the run.
+            import re, subprocess
+
+            WARN_PCT, FAIL_PCT = 80.0, 90.0
+
+            def sh(cmd):
+                try:
+                    return subprocess.run(cmd, shell=True, capture_output=True,
+                                          text=True, timeout=60).stdout
+                except Exception:
+                    return ''
+
+            mem = sh('free -m')
+            row = next((l for l in mem.splitlines() if l.strip().startswith('Mem:')), '')
+            swap = next((l for l in mem.splitlines() if l.strip().startswith('Swap:')), '')
+            nums = [int(x) for x in re.findall(r'\d+', row)]
+            swapn = [int(x) for x in re.findall(r'\d+', swap)]
+
+            if len(nums) < 2:
+                print('COMPANION_RESOURCE_GUARD UNREADABLE could not parse free -m')
+                raise SystemExit(0)
+
+            total, used = nums[0], nums[1]
+            avail = nums[5] if len(nums) > 5 else None
+            pct = 100.0 * used / total if total else 0.0
+            swap_total = swapn[0] if swapn else 0
+
+            verdict = ('OVER_CEILING' if pct >= FAIL_PCT else
+                       'OVER_BUDGET' if pct >= WARN_PCT else 'OK')
+            print('COMPANION_RESOURCE_GUARD %s used=%dMB total=%dMB pct=%.1f%% '
+                  'available=%sMB swap=%dMB warn_at=%.0f%% fail_at=%.0f%%'
+                  % (verdict, used, total, pct, avail, swap_total, WARN_PCT, FAIL_PCT))
+
+            if swap_total == 0:
+                print('COMPANION_RESOURCE_GUARD_NOTE swap is ZERO, so there is no '
+                      'elastic headroom: the kernel goes straight from pressure '
+                      'to killing a process.')
+
+            stats = sh("docker stats --no-stream --format '{{.Name}} {{.MemUsage}} {{.MemPerc}} {{.CPUPerc}}'")
+            worst, worst_pct = None, 0.0
+            for line in stats.splitlines():
+                m = re.match(r'(\S+)\s+(\S+) / \S+\s+([\d.]+)%\s+([\d.]+)%', line.strip())
+                if not m:
+                    continue
+                name, mp = m.group(1), float(m.group(3))
+                if mp > worst_pct:
+                    worst, worst_pct = name, mp
+            if worst:
+                print('COMPANION_RESOURCE_LARGEST %s at %.1f%% of host memory'
+                      % (worst, worst_pct))
+
+            if verdict == 'OVER_CEILING':
+                raise SystemExit(
+                    'Companion host at %.1f%% memory, at or past the %.0f%% ceiling. '
+                    'A kill is imminent; the largest consumer is %s.'
+                    % (pct, FAIL_PCT, worst))
+            PYGUARD
+
+            echo "COMPANION_HOST_RESOURCES_COMPLETE"
