@@ -300,5 +300,26 @@ jobs:
                     'A kill is imminent; the largest consumer is %s.'
                     % (pct, FAIL_PCT, worst))
             PYGUARD
+            # CARRY THE GUARD'S EXIT STATUS OUT OF THE SCRIPT.
+            #
+            # This script runs under `set -uo pipefail` -- note the absent -e.
+            # A non-zero exit from the heredoc above therefore does not abort
+            # it, and the echo below reset $? to 0, so ssh-action saw a clean
+            # exit and marked the run green no matter what the guard decided.
+            #
+            # Measured, not theorised. At 05:41 on 2026-09-12, forty minutes
+            # after the OOM ceiling was merged, this workflow printed
+            #
+            #   The kernel OOM-killed 6 process(es) on the companion host in
+            #   the last 6 hours: 03:09:35 ... 05:32:00
+            #
+            # and the run concluded SUCCESS. The host OVER_CEILING raise had
+            # been in the same state since it was written: never able to fail.
+            #
+            # The guard was fixed to raise and the raise still went nowhere,
+            # which is the same fault one layer further out than anyone looked.
+            # A verdict that cannot fail the run is a print statement.
+            guard_rc=$?
 
             echo "COMPANION_HOST_RESOURCES_COMPLETE"
+            exit "$guard_rc"
