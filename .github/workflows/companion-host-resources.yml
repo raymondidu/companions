@@ -120,18 +120,69 @@ jobs:
               echo "COMPANION_OOM_RECENT NONE_IN_BUFFER"
             fi
 
+            # BOTH PROBES BELOW WERE READING A CONTAINER THAT DOES NOT EXIST.
+            #
+            # The containers on this host are named by compose:
+            # companions-companion-scanner-1, companions-companion-dashboard-1.
+            # This asked for "companion-scanner" and matched "^companion-", so
+            # `docker logs` answered "Error response from daemon: No such
+            # container" on every run since the day it was written, and the
+            # restart loop printed nothing at all.
+            #
+            # Worse than useless: the log probe then fell through to
+            # COMPANION_EVENT NONE_IN_WINDOW, which reads as "the scanner is
+            # clean". It was never read. On 2026-09-12, with the kernel killing
+            # a process on this box every few minutes, the one probe that would
+            # say whether the SCANNER was surviving was answering "no events"
+            # because it was pointed at nothing.
+            #
+            # Names are resolved from docker itself now, and a name that
+            # resolves to nothing is reported as UNRESOLVED rather than clean.
+            SCANNER="$(docker ps -a --format '{{.Names}}' \
+              | grep -E 'companion[-_]?scanner' | head -1 || true)"
+            DASHBOARD="$(docker ps -a --format '{{.Names}}' \
+              | grep -E 'companion[-_]?dashboard' | head -1 || true)"
+            echo "COMPANION_CONTAINERS_RESOLVED scanner=${SCANNER:-UNRESOLVED} dashboard=${DASHBOARD:-UNRESOLVED}"
+
             echo "COMPANION_RESTART_COUNTS"
-            for c in $(docker ps -a --format '{{.Names}}' | grep '^companion-' || true); do
-              echo "COMPANION_RESTARTS $c $(docker inspect -f '{{.RestartCount}}' "$c" 2>/dev/null || echo '?')"
+            for c in $(docker ps -a --format '{{.Names}}' \
+                       | grep -E 'companion' || true); do
+              echo "COMPANION_RESTARTS $c $(docker inspect -f '{{.RestartCount}} {{.State.Status}} {{.State.OOMKilled}} {{.State.ExitCode}}' "$c" 2>/dev/null || echo '?')"
             done
 
             # A stale scanner and a crashed scanner look identical from
             # outside the container. Its own tail is the only thing that says
             # which, and the rare lines are the ones that matter.
             echo "COMPANION_SCANNER_EVENTS"
-            docker logs --tail 4000 companion-scanner 2>&1 \
-              | grep -aiE 'Traceback|CRITICAL|ERROR|SCANNER_STALE|DELIVERY_ERROR|database is locked|restart' \
-              | tail -25 | sed "s/^/COMPANION_EVENT /" || echo "COMPANION_EVENT NONE_IN_WINDOW"
+            if [ -z "$SCANNER" ]; then
+              echo "COMPANION_EVENT UNRESOLVED no container matched a scanner name;"
+              echo "COMPANION_EVENT this says NOTHING about scanner health."
+            else
+              docker logs --tail 4000 "$SCANNER" 2>&1 \
+                | grep -aiE 'Traceback|CRITICAL|ERROR|SCANNER_STALE|DELIVERY_ERROR|database is locked|restart' \
+                | tail -25 | sed "s/^/COMPANION_EVENT /" || true
+              echo "COMPANION_SCANNER_TAIL $SCANNER"
+              docker logs --tail 12 "$SCANNER" 2>&1 | sed "s/^/COMPANION_TAIL /" || true
+            fi
+
+            # WHOSE MEMORY IS THIS? A second goldsignal stack runs on this box
+            # and is the largest consumer on it. Whether it is a live deployment
+            # or an abandoned one is an owner decision that nobody can make
+            # without knowing if it is doing anything, so read it: uptime, and
+            # whether its scanner has logged anything recently.
+            echo "COMPANION_FOREIGN_STACK"
+            for c in $(docker ps -a --format '{{.Names}}' \
+                       | grep -E '^goldsignal' || true); do
+              echo "COMPANION_FOREIGN $c $(docker inspect -f '{{.State.Status}} started={{.State.StartedAt}} restarts={{.RestartCount}}' "$c" 2>/dev/null || echo '?')"
+            done
+            GOLDSCAN="$(docker ps -a --format '{{.Names}}' \
+              | grep -E '^goldsignal.*scanner' | head -1 || true)"
+            if [ -n "$GOLDSCAN" ]; then
+              echo "COMPANION_FOREIGN_SCANNER_TAIL $GOLDSCAN"
+              docker logs --tail 8 "$GOLDSCAN" 2>&1 | sed "s/^/COMPANION_FOREIGN_LOG /" || true
+            else
+              echo "COMPANION_FOREIGN_SCANNER none resolved"
+            fi
 
             python3 - <<'PYGUARD'
             # Same thresholds and the same reasoning as the Gold guard, so the
