@@ -112,3 +112,52 @@ def test_ci_runs_the_whole_tests_directory_not_a_hand_maintained_list():
     assert not named, (
         'CI enumerates individual test files again, so anything not listed will '
         'silently never run: %r' % named)
+
+
+HOST_GUARD = Path(__file__).resolve().parents[1] / '.github' / 'workflows' / 'companion-host-resources.yml'
+
+
+def test_the_host_guard_verdict_can_actually_fail_the_run():
+    """A verdict that cannot fail the run is a print statement.
+
+    The guard raises SystemExit on an OOM kill and on OVER_CEILING. Both raises
+    went nowhere. The ssh script runs under `set -uo pipefail` -- no -e -- so a
+    non-zero exit from the guard heredoc did not abort it, and the trailing echo
+    reset $? to 0. ssh-action saw a clean exit and marked the run green.
+
+    Measured, not theorised. At 05:41 on 2026-09-12, forty minutes after the OOM
+    ceiling was merged, this workflow printed
+
+      The kernel OOM-killed 6 process(es) on the companion host in the last
+      6 hours: 03:09:35 ... 05:32:00
+
+    and the run concluded SUCCESS. The host OVER_CEILING raise had been in that
+    state since it was written.
+
+    Text matching would not have caught this -- the raise really was there. So
+    this executes the real trailing structure taken from the parsed YAML, with
+    the guard stubbed to a known failing status, and asserts the script carries
+    that status out.
+    """
+    import re
+    import subprocess
+    import textwrap
+
+    doc = yaml.safe_load(HOST_GUARD.read_text(encoding='utf-8'))
+    script = None
+    for step in doc['jobs']['resources']['steps']:
+        blob = str((step.get('with') or {}).get('script') or step.get('run') or '')
+        if 'PYGUARD' in blob:
+            script = blob
+    assert script, 'guard step not found in the parsed workflow'
+
+    stubbed = re.sub(r"python3 - <<'PYGUARD'\n.*?\n\s*PYGUARD",
+                     "python3 -c 'raise SystemExit(7)'", script, flags=re.S)
+    assert 'PYGUARD' not in stubbed, 'guard heredoc was not stubbed out'
+    tail = stubbed[stubbed.index("python3 -c 'raise SystemExit(7)'"):]
+    body = 'set -uo pipefail\n' + textwrap.dedent(tail)
+
+    result = subprocess.run(['bash', '-c', body], capture_output=True, text=True)
+    assert result.returncode != 0, (
+        'the guard exited 7 and the script still returned 0; the verdict '
+        'cannot fail the run.\nscript tail was:\n%s' % body)
