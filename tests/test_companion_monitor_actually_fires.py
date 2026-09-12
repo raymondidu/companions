@@ -161,3 +161,49 @@ def test_the_host_guard_verdict_can_actually_fail_the_run():
     assert result.returncode != 0, (
         'the guard exited 7 and the script still returned 0; the verdict '
         'cannot fail the run.\nscript tail was:\n%s' % body)
+
+
+def test_no_probe_addresses_a_hardcoded_container_name():
+    """A probe pointed at a container that does not exist reports nothing,
+    and nothing reads as nothing wrong.
+
+    compose names these containers companions-companion-scanner-1 and
+    companions-companion-dashboard-1. Two probes asked for "companion-scanner"
+    and matched "^companion-", so docker answered "No such container" on every
+    run since they were written. COMPANION_RESTART_COUNTS printed nothing at
+    all, and COMPANION_SCANNER_EVENTS fell through to NONE_IN_WINDOW -- which
+    reads as a clean scanner.
+
+    That mattered on 2026-09-12: with the kernel killing a process on that box
+    every few minutes, the one probe that would have said whether the SCANNER
+    was surviving was answering "no events" because it pointed at nothing.
+
+    Names are resolved from docker at runtime now. This pins that, and pins
+    that an unresolved name degrades instead of reading clean.
+    """
+    guard = HOST_GUARD.read_text(encoding='utf-8')
+
+    # The exact dead reference, and the anchored prefix that could not match.
+    assert 'docker logs --tail 4000 companion-scanner' not in guard, \
+        'the scanner log probe is back on a hardcoded name docker does not have'
+    assert "grep '^companion-'" not in guard, \
+        "'^companion-' cannot match companions-companion-scanner-1"
+
+    # Resolved from docker, not assumed.
+    assert 'COMPANION_CONTAINERS_RESOLVED' in guard, \
+        'container names are no longer resolved from docker at runtime'
+
+    # Absence of evidence degrades: an unresolved name must not read as clean.
+    assert 'UNRESOLVED' in guard and 'says NOTHING about scanner health' in guard, \
+        'an unresolved container name falls through to something that reads healthy'
+
+
+def test_the_foreign_stack_on_this_host_is_measured():
+    """A second goldsignal stack runs on the companion box and is its largest
+    consumer. Whether it is live or abandoned is an owner decision, and nobody
+    can make it without knowing whether the thing is doing anything."""
+    guard = HOST_GUARD.read_text(encoding='utf-8')
+    assert 'COMPANION_FOREIGN_STACK' in guard, \
+        'nothing reports the foreign stack sharing this host'
+    assert 'COMPANION_FOREIGN_SCANNER_TAIL' in guard, \
+        'its scanner is never read, so live vs abandoned stays unanswerable'
