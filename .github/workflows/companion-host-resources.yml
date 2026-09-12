@@ -101,8 +101,24 @@ jobs:
             # kernel shot it". Gold's dashboard was killed this way at
             # 15:50:03 and without dmesg that would have stayed a theory.
             echo "COMPANION_OOM_RECENT"
-            (dmesg -T 2>/dev/null | grep -iE 'out of memory|oom-kill|killed process' | tail -15) \
-              || echo "COMPANION_OOM_RECENT NONE_OR_DMESG_UNREADABLE"
+            # Kept in a file as well as printed, because the verdict below has
+            # to READ this, not just display it. See the guard block.
+            # An empty result has two very different causes -- no kills, or
+            # dmesg refusing to be read -- and they must not look the same to
+            # the verdict below. dmesg is probed first and its failure is
+            # recorded explicitly, so "clean" is only ever claimed about a
+            # buffer we actually read.
+            if dmesg -T >/dev/null 2>&1; then
+              dmesg -T 2>/dev/null | grep -iE 'out of memory|oom-kill|killed process' \
+                > /tmp/companion_oom.txt || true
+            else
+              echo "DMESG_UNREADABLE" > /tmp/companion_oom.txt
+            fi
+            if [ -s /tmp/companion_oom.txt ]; then
+              tail -15 /tmp/companion_oom.txt
+            else
+              echo "COMPANION_OOM_RECENT NONE_IN_BUFFER"
+            fi
 
             echo "COMPANION_RESTART_COUNTS"
             for c in $(docker ps -a --format '{{.Names}}' | grep '^companion-' || true); do
@@ -123,8 +139,25 @@ jobs:
             # absorbing a spike; 90% is where a kill is imminent rather than
             # possible, so that is the line that fails the run.
             import re, subprocess
+            from datetime import datetime
 
             WARN_PCT, FAIL_PCT = 80.0, 90.0
+
+            # A KERNEL OOM KILL IS NOT A THRESHOLD. IT ALREADY HAPPENED.
+            #
+            # This guard collected dmesg OOM lines from the day it was written
+            # and the verdict never looked at them. On 2026-09-12 the kernel
+            # killed uvicorn five times in under two hours -- 02:56, 03:09,
+            # 03:34, 04:33, 04:39, every one of them constraint=CONSTRAINT_NONE
+            # and global_oom on a 1963MB box with ZERO swap -- and this guard
+            # printed OK, because host memory read 76.8% and the only exit
+            # condition was 90%.
+            #
+            # Percentages are a forecast. A kill is an outcome. A guard that
+            # forecasts while outcomes are landing is not a guard, and this is
+            # the third place in these repos where a number was computed,
+            # printed and never enforced.
+            OOM_WINDOW_HOURS = 6.0
 
             def sh(cmd):
                 try:
@@ -159,18 +192,107 @@ jobs:
                       'elastic headroom: the kernel goes straight from pressure '
                       'to killing a process.')
 
+            # docker stats MemPerc is a percentage of the CONTAINER'S OWN
+            # limit, not of the host. On this box nothing sets mem_limit, so
+            # docker reports the host size as every container's limit and the
+            # two happen to coincide -- which is exactly why this bug survived
+            # here after being fixed on the Gold guard in goldsignal#45. The
+            # day any container here gets a cap, the old label starts lying and
+            # the ranking starts naming whichever container is most tightly
+            # capped rather than the one holding the most memory.
+            def to_mb(text):
+                m = re.match(r'([\d.]+)\s*([KMGT]?i?B)$', text.strip(), re.I)
+                if not m:
+                    return None
+                scale = {'B': 1.0/(1024*1024), 'KIB': 1.0/1024, 'MIB': 1.0,
+                         'GIB': 1024.0, 'TIB': 1024.0*1024,
+                         'KB': 1.0/1024, 'MB': 1.0, 'GB': 1024.0, 'TB': 1024.0*1024}
+                factor = scale.get(m.group(2).upper())
+                return float(m.group(1)) * factor if factor else None
+
             stats = sh("docker stats --no-stream --format '{{.Name}} {{.MemUsage}} {{.MemPerc}} {{.CPUPerc}}'")
-            worst, worst_pct = None, 0.0
+            worst, worst_mb, worst_share = None, 0.0, 0.0
+            uncapped = []
             for line in stats.splitlines():
-                m = re.match(r'(\S+)\s+(\S+) / \S+\s+([\d.]+)%\s+([\d.]+)%', line.strip())
+                m = re.match(r'(\S+)\s+(\S+) / (\S+)\s+([\d.]+)%\s+([\d.]+)%', line.strip())
                 if not m:
                     continue
-                name, mp = m.group(1), float(m.group(3))
-                if mp > worst_pct:
-                    worst, worst_pct = name, mp
+                name, usage, cap = m.group(1), m.group(2), m.group(3)
+                used_mb, cap_mb = to_mb(usage), to_mb(cap)
+                share = (100.0 * used_mb / total) if (used_mb is not None and total) else None
+                # No cap at all: docker reports the host size as the limit, so
+                # this container can take the whole machine down and leave the
+                # kernel choosing the victim. That is what happened here.
+                if cap_mb is not None and total and cap_mb >= total * 0.95:
+                    uncapped.append(name)
+                print('COMPANION_RESOURCE_CONTAINER %s mem=%s cap=%s used_mb=%s '
+                      'pct_of_host=%s cpu_pct=%s'
+                      % (name, usage, cap,
+                         ('%.1f' % used_mb) if used_mb is not None else 'UNPARSEABLE',
+                         ('%.1f' % share) if share is not None else 'UNKNOWN',
+                         m.group(5)))
+                if used_mb is not None and used_mb > worst_mb:
+                    worst, worst_mb, worst_share = name, used_mb, (share or 0.0)
             if worst:
-                print('COMPANION_RESOURCE_LARGEST %s at %.1f%% of host memory'
-                      % (worst, worst_pct))
+                print('COMPANION_RESOURCE_LARGEST %s holding %.1fMB, %.1f%% of the '
+                      '%dMB host' % (worst, worst_mb, worst_share, total))
+            if uncapped:
+                print('COMPANION_RESOURCE_UNCAPPED %d container(s) here have no '
+                      'mem_limit, so nothing bounds them and the kernel is the '
+                      'only limiter: %s' % (len(uncapped), ', '.join(uncapped)))
+
+            # THE KILLS THE PERCENTAGE DID NOT PREDICT.
+            #
+            # Read the dmesg lines the step above already saved. A global OOM
+            # kill -- constraint=CONSTRAINT_NONE -- means the whole machine ran
+            # out, not one cgroup, so the kernel picked victims wherever it
+            # could reach: on 2026-09-12 it was invoked from sshd, dockerd and
+            # containerd-shim, and killed uvicorn every time.
+            kills = []
+            try:
+                with open('/tmp/companion_oom.txt') as handle:
+                    raw = handle.read()
+            except Exception:
+                raw = ''
+            now = datetime.now()
+            for line in raw.splitlines():
+                if 'killed process' not in line.lower():
+                    continue
+                stamp = re.match(r'\[(.{24})\]', line)
+                if not stamp:
+                    continue
+                try:
+                    when = datetime.strptime(stamp.group(1).strip(),
+                                             '%a %b %d %H:%M:%S %Y')
+                except ValueError:
+                    continue
+                age_h = (now - when).total_seconds() / 3600.0
+                if 0 <= age_h <= OOM_WINDOW_HOURS:
+                    victim = re.search(r'Killed process \d+ \((\S+?)\)', line)
+                    kills.append((when.strftime('%H:%M:%S'),
+                                  victim.group(1) if victim else 'unknown'))
+            # Absence of evidence degrades. A buffer we could not read is not
+            # a quiet kernel, and reporting it as clean is how a guard ends up
+            # certifying the thing it was blind to.
+            unreadable = 'DMESG_UNREADABLE' in raw
+            print('COMPANION_OOM_VERDICT %s in the last %.0fh: %s'
+                  % ('UNREADABLE' if unreadable else 'KILLS' if kills else 'NONE',
+                     OOM_WINDOW_HOURS,
+                     'dmesg could not be read, so nothing is claimed either way'
+                     if unreadable else
+                     ', '.join('%s %s' % k for k in kills) if kills else 'clean'))
+
+            # Reported after the host verdict so a host emergency still wins
+            # the exit message, but a kill that already landed is its own
+            # failure and does not wait for a percentage to agree with it.
+            if kills:
+                raise SystemExit(
+                    'The kernel OOM-killed %d process(es) on the companion host '
+                    'in the last %.0f hours: %s. Host memory reads %.1f%% and '
+                    'swap is %dMB, so the percentage thresholds did NOT and '
+                    'will NOT catch this.'
+                    % (len(kills), OOM_WINDOW_HOURS,
+                       ', '.join('%s %s' % k for k in kills), pct, swap_total))
 
             if verdict == 'OVER_CEILING':
                 raise SystemExit(
