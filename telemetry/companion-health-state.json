@@ -1,17 +1,12 @@
 {
-  "captured_at_epoch": 1789588527.4146729,
-  "cleared_this_pass": [
-    "MARKET_NOT_RUNNING_SILVER",
-    "MARKET_NOT_RUNNING_USOIL",
-    "SCANS_NOT_ADVANCING",
-    "SILVER_NOT_REFUSED"
-  ],
+  "captured_at_epoch": 1789590276.4189513,
+  "cleared_this_pass": [],
   "lifecycle": {
     "accepted": 70,
     "closed_positions": 27,
     "closed_signals": 20,
     "generated": 90,
-    "open_failed_positions": 838,
+    "open_failed_positions": 842,
     "open_failed_signals": 46,
     "opened_positions": 51,
     "opened_signals": 33,
@@ -19,7 +14,7 @@
   },
   "open_failure_reasons": {
     "BELOW_MIN_CAPITAL": 57,
-    "BROKER_OPEN_FAILED": 581,
+    "BROKER_OPEN_FAILED": 585,
     "COMPANION_INSUFFICIENT_CAPITAL_TO_STACK": 2,
     "INSTRUMENT_POSITION_OPEN": 1,
     "NO_BROKER": 1,
@@ -28,5 +23,5 @@
   },
   "open_faults": [],
   "opening_stall_intervals": 0,
-  "scans": 4
+  "scans": 17
 }
