@@ -38,7 +38,7 @@ def _status(key: str) -> dict:
 @app.get('/health')
 def health():
     states={k:_status(k) for k in MARKETS}
-    return {'ok':all(x.get('state')=='RUNNING' for x in states.values()),'service':'COMPANION_RESEARCH_WITH_TRADEHOUSE_DELIVERY','deploy_sha':os.getenv('COMPANION_DEPLOY_SHA','UNKNOWN'),'isolation':isolation_contract(),'markets':states,'tradehouse':delivery_snapshot()}
+    return {'ok':all(x.get('state')=='RUNNING' for x in states.values()),'service':'COMPANION_RESEARCH_WITH_TRADEHOUSE_DELIVERY','deploy_sha':os.getenv('COMPANION_DEPLOY_SHA','UNKNOWN'),'isolation':isolation_contract(),'markets':states,'tradehouse':delivery_snapshot(ledger='none')}
 
 
 @app.get('/api/isolation-contract')
@@ -47,7 +47,7 @@ def isolation(): return isolation_contract()
 
 @app.get('/api/markets')
 def markets():
-    return {'ok':True,'paper_only':True,'live_authority':False,'tradehouse_delivery':True,'markets':{k:_status(k) for k in MARKETS},'tradehouse':delivery_snapshot()}
+    return {'ok':True,'paper_only':True,'live_authority':False,'tradehouse_delivery':True,'markets':{k:_status(k) for k in MARKETS},'tradehouse':delivery_snapshot(ledger='latest')}
 
 
 @app.get('/api/companion/tradehouse')
