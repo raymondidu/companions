@@ -1,0 +1,185 @@
+name: Companion Callback Auth Probe
+
+# READ-ONLY. Changes nothing, sends nothing, cannot place or close a trade, and
+# never writes or rotates a credential.
+#
+# WHY THIS EXISTS. The executor asked us to confirm our callback verifier holds
+# a secret whose sha8 fingerprint is 00b972a2, and offered to "align on one
+# shared value out-of-band" if it differs. Exchanging a live trading credential
+# over chat to settle a question a hash can settle is the wrong trade. This
+# answers it from the box instead.
+#
+# NO SECRET VALUE IS EMITTED, IN EITHER DIRECTION. What is printed: the NAME of
+# the environment variable that supplies the secret, its LENGTH, and truncated
+# one-way fingerprints. A fingerprint is not a value and cannot be reversed into
+# one; it is the only way to compare two secrets without either side sending
+# theirs.
+#
+# IT PRINTS SEVERAL ALGORITHMS ON PURPOSE. "sha8" is ambiguous -- it could be
+# the first 8 hex of SHA-256, of SHA-1, or of MD5. If we computed one and they
+# computed another, a mismatch would be a FALSE ALARM, and the proposed remedy
+# for a false alarm here is rotating a live credential. So every plausible
+# reading is printed and the verdict says which one matched.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: companion-callback-auth-probe
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: Fingerprint the callback secret and read live rejection reasons
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.DO_HOST }}
+          username: ${{ secrets.DO_USER }}
+          key: ${{ secrets.DO_SSH_KEY }}
+          port: 22
+          timeout: 45s
+          command_timeout: 5m
+          script: |
+            set -uo pipefail
+            cd /home/companions
+
+            # THE COUNTERS LIVE IN THE DASHBOARD PROCESS, NOT IN A NEW ONE.
+            # _CALLBACK_REJECTS is a module-level dict whose own docstring says
+            # "counts since this process started". Callbacks arrive at uvicorn
+            # companion_app, so a fresh `docker compose exec` python would read
+            # an EMPTY dict and print zeros -- and zeros here would read as "no
+            # rejections", which is the opposite of the truth. So this asks the
+            # dashboard over HTTP and reports UNREADABLE if it cannot answer.
+            # /health has been timing out for days under the callback flood; the
+            # executor says that is fixed, so this also measures whether it is.
+            if curl --connect-timeout 5 --max-time 25 -fsS http://127.0.0.1:8082/health \
+                 -o /tmp/companion_health.json 2>/dev/null; then
+              echo "COMPANION_HEALTH_READ ok"
+            else
+              echo "COMPANION_HEALTH_READ UNREADABLE /health did not answer in 25s -- the"
+              echo "  live rejection counters below are UNAVAILABLE, not zero."
+              : > /tmp/companion_health.json
+            fi
+
+            timeout 120 docker compose exec -T companion-scanner python3 - <<'PYAUTH' || echo "COMPANION_CALLBACK_AUTH UNREADABLE_OR_TIMED_OUT this says nothing about the secret"
+            import hashlib, json, os
+
+            THEIRS = '00b972a2'
+
+            # Exactly the lookup order companion_tradehouse._callback_secret uses.
+            # It is SEVEN names deep, and the last four are the OUTBOUND executor
+            # secret. If the callback verifier is falling through to those, the
+            # fingerprints will differ for a reason that is a missing env var on
+            # our side, NOT a value both parties need to renegotiate. Getting that
+            # backwards would rotate a live credential to fix a typo.
+            CALLBACK_NAMES = ('COMPANION_CALLBACK_SECRET',
+                              'COMPANION_CALLBACK_HMAC_SECRET',
+                              'TRADEHOUSE_CALLBACK_HMAC_SECRET')
+            EXECUTOR_NAMES = ('COMPANION_EXECUTOR_SECRET',
+                              'TRADEHOUSE_EXECUTOR_SECRET',
+                              'GOLD_EXECUTOR_SECRET',
+                              'EXECUTOR_SECRET')
+
+            def prints(value):
+                """Truncated one-way digests. Never the value, never a full digest."""
+                b = value.encode('utf-8')
+                return {
+                    'sha256_8': hashlib.sha256(b).hexdigest()[:8],
+                    'sha1_8': hashlib.sha1(b).hexdigest()[:8],
+                    'md5_8': hashlib.md5(b).hexdigest()[:8],
+                }
+
+            def first_set(names):
+                for n in names:
+                    v = os.getenv(n, '').strip()
+                    if v:
+                        return n, v
+                return None, ''
+
+            # Which name is actually supplying it, reported as a name.
+            cb_name, cb_value = first_set(CALLBACK_NAMES)
+            ex_name, ex_value = first_set(EXECUTOR_NAMES)
+            resolved_name, resolved = (cb_name, cb_value) if cb_value else (ex_name, ex_value)
+
+            print('COMPANION_CALLBACK_SECRET_SOURCE name=%s fell_back_to_outbound=%s'
+                  % (resolved_name or 'NONE_SET', bool(not cb_value and ex_value)))
+            for n in CALLBACK_NAMES + EXECUTOR_NAMES:
+                v = os.getenv(n, '').strip()
+                print('COMPANION_SECRET_PRESENT name=%s present=%s length=%d'
+                      % (n, bool(v), len(v)))
+
+            if not resolved:
+                print('COMPANION_FINGERPRINT_VERDICT NO_SECRET_CONFIGURED -- the verifier '
+                      'has nothing to check against and every callback is refused as '
+                      'NO_CALLBACK_SECRET_CONFIGURED. That is not a mismatch with the '
+                      'executor; it is a missing environment variable on this box.')
+            else:
+                fp = prints(resolved)
+                print('COMPANION_FINGERPRINT name=%s length=%d %s'
+                      % (resolved_name, len(resolved),
+                         ' '.join('%s=%s' % kv for kv in sorted(fp.items()))))
+                matched = [k for k, v in fp.items() if v == THEIRS]
+                if matched:
+                    print('COMPANION_FINGERPRINT_VERDICT MATCH algorithm=%s theirs=%s -- the '
+                          'two sides hold the SAME secret. Any remaining rejection is not a '
+                          'key problem and rotating would break a working path.'
+                          % (','.join(matched), THEIRS))
+                else:
+                    # NOT "they differ". An unmatched truncated hash under three
+                    # guessed algorithms is weaker evidence than it looks, and the
+                    # remedy on the table is rotating a live credential.
+                    print('COMPANION_FINGERPRINT_VERDICT NO_MATCH_UNDER_SHA256_SHA1_OR_MD5 '
+                          'theirs=%s. This is evidence of a different secret, NOT proof: '
+                          '"sha8" was never defined, and if they digested a decoded or '
+                          'base64 form, or salted it, an identical secret would still miss '
+                          'here. Ask which algorithm and over which encoding BEFORE anyone '
+                          'rotates anything.' % THEIRS)
+
+            # Nothing above proves callbacks are being accepted. This does.
+            try:
+                h = json.load(open('/tmp/companion_health.json'))
+            except Exception:
+                h = None
+            if not h:
+                print('COMPANION_CALLBACK_REJECTS UNREADABLE /health did not answer, so the '
+                      'per-reason counters could not be read. UNREADABLE is not zero.')
+            else:
+                th = h.get('tradehouse') or {}
+                rejects = th.get('callback_rejections')
+                if rejects is None:
+                    print('COMPANION_CALLBACK_REJECTS ABSENT the running build predates the '
+                          'reason split, so a 401 still cannot be attributed.')
+                else:
+                    print('COMPANION_CALLBACK_REJECTS %s max_age_ms=%s'
+                          % (json.dumps(rejects, sort_keys=True),
+                             th.get('callback_max_age_ms')))
+                    # THE DISTINCTION THE EXECUTOR NEEDS. A replayed backlog event
+                    # older than the max age is refused by design and says nothing
+                    # about the key. Reading those 401s as a signing mismatch is
+                    # how a working secret gets rotated for nothing.
+                    bad = int(rejects.get('BAD_SIGNATURE') or 0)
+                    stale = int(rejects.get('STALE_TIMESTAMP') or 0)
+                    ok = int(rejects.get('ACCEPTED') or 0)
+                    if bad:
+                        print('COMPANION_CALLBACK_VERDICT BAD_SIGNATURE=%d since this '
+                              'process started -- a real signing mismatch, independent of '
+                              'the fingerprint above.' % bad)
+                    elif stale and not ok:
+                        print('COMPANION_CALLBACK_VERDICT ONLY_STALE=%d and nothing accepted '
+                              '-- consistent with backlog replay past the max age, and NOT '
+                              'evidence of a key mismatch.' % stale)
+                    elif ok:
+                        print('COMPANION_CALLBACK_VERDICT ACCEPTING=%d signed callbacks '
+                              'verified since this process started. The secret in use is '
+                              'the right one, whatever a fingerprint says.' % ok)
+                    else:
+                        print('COMPANION_CALLBACK_VERDICT NO_CALLBACKS_SEEN since this '
+                              'process started. Says nothing either way.')
+            PYAUTH
+            echo "COMPANION_CALLBACK_AUTH_COMPLETE"
