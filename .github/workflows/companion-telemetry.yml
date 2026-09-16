@@ -41,7 +41,41 @@ jobs:
             echo "COMPANION_PRODUCTION_SHA $(git rev-parse HEAD)"
             docker compose ps --format '{{.Service}} {{.Status}}' || true
 
-            curl --connect-timeout 5 --max-time 25 -fsS http://127.0.0.1:8082/health -o /tmp/companion_health.json
+            # WHEN THIS CURL FAILS, SAY WHY. It has failed on 9 of the last 10
+            # scheduled runs (2026-09-14 22:33 through 2026-09-16 10:54, one
+            # success at 02:03), each time as a bare
+            # "curl: (28) Operation timed out ... with 0 bytes received" that
+            # took the whole run down under `set -e` and printed nothing about
+            # the box. So the one instrument that says whether USOIL is trading
+            # has been dark for two days and reported only that it was dark.
+            #
+            # The suspect is memory, not the app: this host was measured at
+            # 92.1% with 27MB available and zero swap, OOM-killing a process
+            # every few minutes. That is an OWNER decision to act on, so this
+            # collects the evidence for it and touches nothing.
+            if ! curl --connect-timeout 5 --max-time 25 -fsS \
+                    http://127.0.0.1:8082/health -o /tmp/companion_health.json; then
+              echo "COMPANION_HEALTH_UNREADABLE the dashboard did not answer /health in 25s"
+              echo "COMPANION_HEALTH_UNREADABLE_NOTE this says NOTHING about whether the"
+              echo "  markets are healthy. It means the instrument could not be read."
+              free -m 2>/dev/null | sed 's/^/COMPANION_HOST_MEMORY /' || true
+              docker stats --no-stream --format \
+                '{{.Name}} mem={{.MemUsage}} cpu={{.CPUPerc}}' 2>/dev/null \
+                | sed 's/^/COMPANION_CONTAINER_USAGE /' || true
+              for svc in companion-dashboard companion-scanner; do
+                cid=$(docker compose ps -q "$svc" 2>/dev/null || true)
+                if [ -z "$cid" ]; then
+                  echo "COMPANION_CONTAINER $svc UNRESOLVED means nothing about health"
+                  continue
+                fi
+                docker inspect -f \
+                  "COMPANION_CONTAINER $svc status={{.State.Status}} oomkilled={{.State.OOMKilled}} exit={{.State.ExitCode}} restarts={{.RestartCount}}" \
+                  "$cid" 2>/dev/null || echo "COMPANION_CONTAINER $svc INSPECT_FAILED"
+                docker logs --tail 20 "$cid" 2>&1 | sed "s/^/COMPANION_TAIL $svc /" || true
+              done
+              echo "COMPANION_TELEMETRY_INCOMPLETE"
+              exit 1
+            fi
 
             python3 - <<'PY'
             import json
