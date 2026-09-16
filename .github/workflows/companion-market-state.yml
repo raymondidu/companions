@@ -52,6 +52,13 @@ jobs:
             cd /home/companions
             pwd
 
+            # WHAT THE BOX HAS CHECKED OUT, which is NOT the same question as
+            # what the running container is executing. A checkout moves the
+            # moment the deploy pulls; the container only picks it up when it
+            # is recreated. Printing both is the only way to tell a deploy that
+            # landed from one that merely fetched.
+            echo "COMPANION_CHECKOUT_HEAD $(git -C /home/companions rev-parse HEAD 2>/dev/null || echo UNREADABLE)"
+
             # exec into the ALREADY RUNNING scanner, never `run`: this host has
             # been measured at 88.5% memory with zero swap and starting another
             # container is how a probe causes the next outage.
@@ -63,6 +70,47 @@ jobs:
             print('COMPANION_DATA_DIR %s exists=%s' % (data_dir, data_dir.is_dir()))
             if not data_dir.is_dir():
                 print('COMPANION_MARKET_STATE NO_DATA_DIR'); raise SystemExit(0)
+
+            # WHAT CODE THIS CONTAINER IS ACTUALLY RUNNING, read from inside it.
+            # "The unpause is live" was INFERRED from a green deploy every time
+            # it has been said today, and inference is not measurement. This is
+            # the constant as the container's own source carries it, so a deploy
+            # that built but never recreated shows up as the old value instead of
+            # being invisible. Printed FIRST, before any status file is touched,
+            # so it survives a parse failure further down.
+            #
+            # READ FROM PID 1, NOT FROM os.getenv. `docker compose exec` builds
+            # this process's environment from the COMPOSE FILE against the
+            # calling shell, so COMPANION_DEPLOY_SHA here resolves through
+            # ${COMPANION_DEPLOY_SHA:-UNKNOWN} and would print UNKNOWN whatever
+            # the running scanner actually has. PID 1 is the scanner itself and
+            # carries the value it was started with.
+            sha, src = None, None
+            try:
+                env = dict(
+                    kv.split('=', 1)
+                    for kv in open('/proc/1/environ').read().split('\0')
+                    if '=' in kv)
+                sha, src = env.get('COMPANION_DEPLOY_SHA'), 'pid1'
+            except Exception as e:
+                src = 'pid1_unreadable_%s' % type(e).__name__
+            if not sha:
+                sha, src = os.getenv('COMPANION_DEPLOY_SHA'), src + '+exec_env'
+            print('COMPANION_CONTAINER_DEPLOY_SHA %s source=%s'
+                  % (sha or 'UNREADABLE', src))
+            try:
+                import companion_tradehouse as _ct
+                print('COMPANION_SCAN_AUTHORITY scanning_paused=%s policy=%s '
+                      'callback_max_age_ms=%s'
+                      % (_ct.COMPANION_SCANNING_PAUSED, _ct.POLICY_VERSION,
+                         _ct.CALLBACK_MAX_AGE_MS))
+            except Exception as e:
+                # Never a bare "unknown": name the failure, because a probe that
+                # cannot read the switch and a switch that is off must not print
+                # the same thing.
+                print('COMPANION_SCAN_AUTHORITY UNREADABLE %s: %s -- this says '
+                      'NOTHING about whether scanning is paused'
+                      % (type(e).__name__, str(e)[:120]))
 
             found = sorted(p.name for p in data_dir.glob('*_status.json'))
             print('COMPANION_STATUS_FILES %s' % found)
@@ -87,6 +135,7 @@ jobs:
                 return str(value) if value not in (None, '') else 'NONE'
 
             live = []
+            shas = {}
             for name in found:
                 try:
                     d = json.loads((data_dir / name).read_text())
@@ -99,6 +148,17 @@ jobs:
                 # EVERY market is reported even if one of them is malformed. A
                 # probe that stops at the first surprise answers for whichever
                 # markets happen to sort first, which is not an answer at all.
+                # Which build WROTE this file, and when. A status file is a
+                # snapshot from whichever process was running at the time; a
+                # market that stopped scanning keeps its last file on disk and
+                # reads as current unless the write time is printed beside it.
+                shas[str(d.get('market'))] = str(d.get('deploy_sha') or 'ABSENT')
+                print('COMPANION_MARKET_BUILD market=%s deploy_sha=%s '
+                      'scanner_started_at=%s file_written_at=%s'
+                      % (d.get('market'), d.get('deploy_sha') or 'ABSENT',
+                         d.get('scanner_started_at'),
+                         d.get('last_scan_completed_at')
+                         or d.get('last_scan_started_at') or 'NEVER'))
                 try:
                     bars = as_dict(d.get('data'))
                     # An empty error is normal; a present one is the whole answer.
@@ -131,6 +191,28 @@ jobs:
                           'nothing readable for this market, so its state is UNKNOWN. '
                           'That is a fault in the scanner, not an answer about the '
                           'market.' % m)
+
+            # DID THE DEPLOY REACH THE PROCESS? Three-way on purpose. Every
+            # market agreeing on one sha is the only reading that means "this
+            # build is what is running". Disagreement means one market's file
+            # was written by an older process and is stale on disk. ABSENT or
+            # UNKNOWN means the deploy never passed a sha at all, which is a
+            # gap in the deploy, not evidence about the build.
+            distinct = sorted(set(shas.values()))
+            if not distinct:
+                print('COMPANION_BUILD UNKNOWN no status file carried a deploy_sha')
+            elif len(distinct) > 1:
+                print('COMPANION_BUILD DISAGREEMENT %s -- at least one market is '
+                      'being written by an older process' % shas)
+            elif distinct[0] in ('ABSENT', 'UNKNOWN'):
+                print('COMPANION_BUILD NOT_STAMPED every market reports %r, so the '
+                      'deploy did not pass COMPANION_DEPLOY_SHA. This says nothing '
+                      'about which code is running.' % distinct[0])
+            else:
+                print('COMPANION_BUILD AGREED %s across %d market(s). Compare with '
+                      'COMPANION_CHECKOUT_HEAD above: equal means the deploy reached '
+                      'the process; different means the box pulled but the container '
+                      'was never recreated.' % (distinct[0], len(shas)))
 
             # THE VERDICT IS ABOUT DATA, NOT ABOUT TRADING. Scanning is paused by
             # the owner, so "not delivering" is expected and is NOT a fault. What
