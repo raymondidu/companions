@@ -1,0 +1,165 @@
+name: Companion OANDA Environment Probe
+
+# READ-ONLY. Settles one question and changes nothing:
+# why does the companions OANDA credential answer 401, and is that MY fix or HIS?
+#
+# Measured live 2026-09-16 02:03, the only telemetry run in two days that did
+# not time out:
+#
+#   COMPANION_MARKET USOIL   state ERROR  provider OANDA  bars None/None/None
+#     RuntimeError: OANDA 401: {"errorMessage":"Insufficient authorization ..."}
+#   COMPANION_MARKET SILVER  identical
+#
+# USOIL is one of only two live-eligible companion paths and it cannot fetch a
+# single candle, so it has no data, no candidate and nothing to deliver. That is
+# upstream of every gate.
+#
+# OANDA runs two completely separate environments and returns EXACTLY
+# "Insufficient authorization to perform request" for all three of these:
+#
+#   1. a token minted for the other environment       -> a config line, mine
+#   2. a token that is alive but cannot see THIS      -> an account id fix, mine
+#      account
+#   3. a revoked or expired token                     -> a new credential, his
+#
+# The production error cannot tell them apart, which is why "regenerate the
+# token" has been the standing ask for days without anyone knowing it would
+# work. This asks the token itself and names which of the three it is.
+#
+# This is a SEPARATE credential from goldsignal's, which was replaced 2026-09-14
+# and recovered. Gold working says nothing about this one.
+#
+# NOTHING SECRET IS EMITTED, in either direction. The token is read inside the
+# container and never leaves it; only its LENGTH is printed. The account id is
+# printed as its FIRST SEGMENT ONLY -- OANDA encodes the environment there
+# (101 = practice, 001 = live) and that prefix is a category, not a credential.
+#
+# It runs inside the ALREADY RUNNING scanner via `docker compose exec`, not
+# `run`, and starts no new container: this host was measured at 92.1% memory
+# with 27MB available and zero swap, OOM-killing a process every few minutes,
+# and a probe that adds memory pressure to a memory-starved box is a probe that
+# causes the next outage. The service name comes from docker-compose.yml, which
+# is also what `docker compose ps` prints -- the container is really named
+# companions-companion-scanner-1, and two earlier probes on this host spent
+# weeks reading a container called "companion-scanner" that has never existed.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: companion-oanda-environment-probe
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: Ask the token which environment it belongs to
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.DO_HOST }}
+          username: ${{ secrets.DO_USER }}
+          key: ${{ secrets.DO_SSH_KEY }}
+          port: 22
+          timeout: 45s
+          command_timeout: 5m
+          script: |
+            set -uo pipefail
+            cd /home/companions
+
+            # Never let an unreadable probe read as a clean one.
+            timeout 120 docker compose exec -T companion-scanner python3 - <<'PYPROBE' || echo "COMPANION_OANDA_ENV_PROBE UNREADABLE_OR_TIMED_OUT this says nothing about health"
+            import json, os, urllib.error, urllib.request
+
+            token = os.environ.get('COMPANION_OANDA_TOKEN') or ''
+            account = os.environ.get('COMPANION_OANDA_ACCOUNT_ID') or ''
+            configured = (os.environ.get('COMPANION_OANDA_BASE_URL') or '').rstrip('/')
+
+            # The first segment of an OANDA account id names its environment.
+            # It is a category, not a credential, so it is safe to print and it
+            # is the single most useful fact about this whole outage.
+            prefix = account.split('-')[0] if account else ''
+            says = {'101': 'PRACTICE', '001': 'LIVE'}.get(prefix, 'UNRECOGNISED')
+            print('COMPANION_OANDA_CONFIGURED_HOST %s' % (configured or 'UNSET'))
+            print('COMPANION_OANDA_TOKEN_LENGTH %d' % len(token))
+            print('COMPANION_OANDA_ACCOUNT_PREFIX %s says=%s' % (prefix or 'UNSET', says))
+
+            if not token or not account:
+                print('COMPANION_OANDA_VERDICT CREDENTIALS_MISSING_FROM_THE_ENVIRONMENT '
+                      'token_set=%s account_set=%s -- nothing was ever configured to '
+                      'authorise, so no token can fix this on its own'
+                      % (bool(token), bool(account)))
+                raise SystemExit(0)
+
+            HOSTS = [
+                ('PRACTICE', 'https://api-fxpractice.oanda.com'),
+                ('LIVE', 'https://api-fxtrade.oanda.com'),
+            ]
+
+            def ask(base, path):
+                req = urllib.request.Request(
+                    base + path, headers={'Authorization': 'Bearer %s' % token})
+                try:
+                    with urllib.request.urlopen(req, timeout=15) as response:
+                        return response.status, json.loads(response.read().decode('utf-8')), ''
+                except urllib.error.HTTPError as exc:
+                    detail = ''
+                    try:
+                        detail = json.loads(
+                            exc.read().decode('utf-8')).get('errorMessage', '')
+                    except Exception:
+                        pass
+                    return exc.code, None, detail
+                except Exception as exc:
+                    return None, None, type(exc).__name__
+
+            alive = []          # hosts where the TOKEN authenticates at all
+            sees_account = []   # hosts where the token can also see THIS account
+            for label, base in HOSTS:
+                status, body, detail = ask(base, '/v3/accounts')
+                if status == 200 and body is not None:
+                    ids = [a.get('id') for a in (body.get('accounts') or [])]
+                    alive.append(label)
+                    here = account in ids
+                    if here:
+                        sees_account.append(label)
+                    # The IDS THEMSELVES ARE NOT PRINTED. Only how many, and
+                    # whether the configured one is among them.
+                    print('COMPANION_OANDA_TRY %s status=200 accounts_visible=%d '
+                          'configured_account_present=%s'
+                          % (label, len(ids), here))
+                else:
+                    print('COMPANION_OANDA_TRY %s status=%s detail=%s'
+                          % (label, status if status is not None else 'NO_RESPONSE', detail))
+
+            configured_is_alive = any(
+                configured == base.rstrip('/') for label, base in HOSTS if label in alive)
+
+            # The verdict, stated so it cannot be misread, and always naming
+            # whose fix it is. That is the whole reason this workflow exists.
+            if not alive:
+                print('COMPANION_OANDA_VERDICT CREDENTIAL_DEAD_ON_BOTH_HOSTS '
+                      'the token is revoked or expired; only a new one fixes it, '
+                      'and that is the owner')
+            elif not sees_account:
+                print('COMPANION_OANDA_VERDICT TOKEN_ALIVE_BUT_CANNOT_SEE_THIS_ACCOUNT '
+                      'alive_on=%s -- the token authenticates but COMPANION_OANDA_ACCOUNT_ID '
+                      'is not one of the accounts it covers, so a NEW TOKEN WILL NOT '
+                      'FIX IT; either the account id is wrong or the token was minted '
+                      'for a different account' % ','.join(alive))
+            elif not configured_is_alive:
+                print('COMPANION_OANDA_VERDICT WRONG_HOST_CONFIGURED alive_on=%s '
+                      'configured=%s -- this is a config line on the box, not a '
+                      'credential, and no new token is needed'
+                      % (','.join(sees_account), configured or 'UNSET'))
+            else:
+                print('COMPANION_OANDA_VERDICT HOST_AND_ACCOUNT_BOTH_CORRECT '
+                      'the token authenticates against the configured host and can '
+                      'see the configured account, so the 401 on CANDLES is about '
+                      'instrument permissions or scope on that account, not identity')
+            PYPROBE
+            echo "COMPANION_OANDA_ENV_PROBE_COMPLETE"
