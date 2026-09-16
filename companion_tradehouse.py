@@ -131,6 +131,10 @@ def _callback_position_rows(callbacks: dict):
 
 def delivery_snapshot() -> dict:
     state = _read(_state_path())
+    # WHY CALLBACKS ARE BEING TURNED AWAY, not just how many. Without this the
+    # only visible symptom is 401s in an access log, which cannot separate a
+    # secret mismatch from a stale replay.
+    callback_rejects = callback_rejection_counts()
     callbacks = _read(_callback_path())
     signals = state.get("signals", {})
     callback_signals = callbacks.get("signals", {})
@@ -210,6 +214,11 @@ def delivery_snapshot() -> dict:
         "active_paths": ACTIVE_PATHS,
         "executor_configured": bool(_executor_base_url() and _executor_secret()),
         "callback_configured": bool(_callback_secret()),
+        # WHY callbacks were turned away, since this process started. A bare
+        # count of 401s cannot separate a secret mismatch from a stale replay,
+        # and those need opposite fixes.
+        "callback_rejections": callback_rejects,
+        "callback_max_age_ms": CALLBACK_MAX_AGE_MS,
         "live_enable_requested": os.getenv("COMPANION_TRADEHOUSE_PILOT_ENABLED", "false").strip().lower() == "true",
         "summary": summary,
         "open_failure_reasons": dict(sorted(failure_reasons.items(), key=lambda kv: kv[1], reverse=True)),
@@ -369,26 +378,75 @@ async def deliver_selected_signal(
         return {"eligible": True, "sent": False, "status": "DELIVERY_ERROR", "signal_id": signal_id, "error": record["error"], "path": path}
 
 
-def verify_callback_signature(body: bytes, headers: Any) -> bool:
+# Why a callback was turned away, counted in memory and surfaced in telemetry.
+# The HTTP response stays a bare 401 UNAUTHORIZED_CALLBACK: telling a caller
+# WHICH check it failed is an oracle, and this endpoint is unauthenticated until
+# the signature passes.
+_CALLBACK_REJECTS: dict[str, int] = {}
+
+
+def callback_rejection_reason(body: bytes, headers: Any) -> str:
+    """The reason a callback fails verification, or '' when it passes.
+
+    ONE 401 WAS ANSWERING FOUR DIFFERENT QUESTIONS. On 2026-09-16 the companion
+    dashboard was serving a continuous callback flood with roughly 40% rejected,
+    and that was reported as "40% failing signature verification". It was not
+    knowable: an unset secret, missing headers, a STALE TIMESTAMP and a genuinely
+    wrong signature all returned the same bare False. A catch-all reject reason
+    cannot name a cause, and this one was used to describe the executor's
+    behaviour for hours.
+
+    It matters because TradeHouse was replaying a backlog of 43,350 undelivered
+    events retrying up to 20 times each. CALLBACK_MAX_AGE_MS is FIVE MINUTES, so
+    events older than that can NEVER verify however correct the signature is.
+    STALE_TIMESTAMP and BAD_SIGNATURE need different fixes -- drop the backlog
+    versus align the secret -- and they were indistinguishable.
+
+    The verification itself is UNCHANGED: same checks, same order, same
+    constant-time compare. This only names the branch that was already taken.
+    """
     secret = _callback_secret()
     if not secret:
-        return False
+        return "NO_CALLBACK_SECRET_CONFIGURED"
     timestamp = str(headers.get("x-executor-timestamp") or "").strip()
     supplied = str(headers.get("x-executor-signature") or "").strip().lower()
-    if not timestamp or not supplied:
-        return False
+    if not timestamp:
+        return "MISSING_TIMESTAMP_HEADER"
+    if not supplied:
+        return "MISSING_SIGNATURE_HEADER"
     try:
         ts_ms = int(timestamp)
     except Exception:
-        return False
-    if abs(int(time.time() * 1000) - ts_ms) > CALLBACK_MAX_AGE_MS:
-        return False
+        return "TIMESTAMP_NOT_AN_INTEGER"
+    age_ms = abs(int(time.time() * 1000) - ts_ms)
+    if age_ms > CALLBACK_MAX_AGE_MS:
+        # Seconds instead of milliseconds lands here too, and looks identical to
+        # a genuinely old event. Both are the caller's to fix and neither is a
+        # signature problem.
+        return "STALE_TIMESTAMP"
     try:
         signed = timestamp.encode("utf-8") + b"." + body
         expected = hmac.new(secret.encode("utf-8"), signed, hashlib.sha256).hexdigest().lower()
     except Exception:
+        return "SIGNATURE_COMPUTATION_FAILED"
+    if not hmac.compare_digest(supplied, expected):
+        return "BAD_SIGNATURE"
+    return ""
+
+
+def verify_callback_signature(body: bytes, headers: Any) -> bool:
+    """FAIL-CLOSED. Unchanged behaviour; the reason is recorded, not returned."""
+    reason = callback_rejection_reason(body, headers)
+    if reason:
+        _CALLBACK_REJECTS[reason] = _CALLBACK_REJECTS.get(reason, 0) + 1
         return False
-    return hmac.compare_digest(supplied, expected)
+    _CALLBACK_REJECTS["ACCEPTED"] = _CALLBACK_REJECTS.get("ACCEPTED", 0) + 1
+    return True
+
+
+def callback_rejection_counts() -> dict[str, int]:
+    """Counts since this process started. Names only, never a header value."""
+    return dict(sorted(_CALLBACK_REJECTS.items(), key=lambda kv: -kv[1]))
 
 
 def record_callback(payload: dict) -> tuple[bool, str]:

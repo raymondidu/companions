@@ -214,3 +214,126 @@ class TheContractIsUntouched(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TheCallbackRejectionNamesItsCause(unittest.TestCase):
+    """One 401 was answering four different questions.
+
+    On 2026-09-16 the companion dashboard served a continuous callback flood with
+    roughly 40% rejected, and I reported that as "40% failing signature
+    verification". It was not knowable: an unset secret, missing headers, a STALE
+    TIMESTAMP and a genuinely wrong signature all returned the same bare False.
+
+    It mattered. TradeHouse was replaying 43,350 undelivered events retrying up
+    to 20 times each, and CALLBACK_MAX_AGE_MS is FIVE MINUTES, so anything older
+    than that can never verify however correct its signature is. STALE_TIMESTAMP
+    and BAD_SIGNATURE need opposite fixes -- drop the backlog versus align the
+    secret -- and they were indistinguishable.
+    """
+
+    def setUp(self):
+        import hashlib as _h, hmac as _hm, time as _t
+        self._h, self._hm, self._t = _h, _hm, _t
+        self._saved = os.environ.get('COMPANION_CALLBACK_SECRET')
+        os.environ['COMPANION_CALLBACK_SECRET'] = 'test-secret-name-only'
+        th._CALLBACK_REJECTS.clear()
+
+    def tearDown(self):
+        if self._saved is None:
+            os.environ.pop('COMPANION_CALLBACK_SECRET', None)
+        else:
+            os.environ['COMPANION_CALLBACK_SECRET'] = self._saved
+        th._CALLBACK_REJECTS.clear()
+
+    def _sign(self, body, ts_ms, secret='test-secret-name-only'):
+        signed = str(ts_ms).encode() + b'.' + body
+        return self._hm.new(secret.encode(), signed, self._h.sha256).hexdigest()
+
+    def _now_ms(self):
+        return int(self._t.time() * 1000)
+
+    def test_a_good_callback_passes_and_is_counted(self):
+        body = b'{"signal_id":"x"}'
+        ts = self._now_ms()
+        headers = {'x-executor-timestamp': str(ts),
+                   'x-executor-signature': self._sign(body, ts)}
+        self.assertEqual(th.callback_rejection_reason(body, headers), '')
+        self.assertTrue(th.verify_callback_signature(body, headers))
+        self.assertEqual(th.callback_rejection_counts().get('ACCEPTED'), 1)
+
+    def test_a_stale_event_is_named_STALE_TIMESTAMP_not_a_signature_failure(self):
+        """The backlog case. The signature is CORRECT and it still cannot pass."""
+        body = b'{"signal_id":"x"}'
+        ts = self._now_ms() - (th.CALLBACK_MAX_AGE_MS + 60_000)
+        headers = {'x-executor-timestamp': str(ts),
+                   'x-executor-signature': self._sign(body, ts)}
+        self.assertEqual(th.callback_rejection_reason(body, headers), 'STALE_TIMESTAMP')
+        self.assertFalse(th.verify_callback_signature(body, headers))
+        self.assertEqual(th.callback_rejection_counts().get('STALE_TIMESTAMP'), 1)
+
+    def test_seconds_instead_of_milliseconds_reads_as_stale(self):
+        """A units mistake is a caller fix, not a secret fix, and must not be
+        reported as a signature problem."""
+        body = b'{}'
+        ts = int(self._t.time())          # SECONDS
+        headers = {'x-executor-timestamp': str(ts),
+                   'x-executor-signature': self._sign(body, ts)}
+        self.assertEqual(th.callback_rejection_reason(body, headers), 'STALE_TIMESTAMP')
+
+    def test_a_wrong_secret_is_named_BAD_SIGNATURE(self):
+        body = b'{}'
+        ts = self._now_ms()
+        headers = {'x-executor-timestamp': str(ts),
+                   'x-executor-signature': self._sign(body, ts, secret='the-other-secret')}
+        self.assertEqual(th.callback_rejection_reason(body, headers), 'BAD_SIGNATURE')
+
+    def test_missing_headers_are_named_separately(self):
+        body = b'{}'
+        ts = str(self._now_ms())
+        self.assertEqual(
+            th.callback_rejection_reason(body, {'x-executor-signature': 'abc'}),
+            'MISSING_TIMESTAMP_HEADER')
+        self.assertEqual(
+            th.callback_rejection_reason(body, {'x-executor-timestamp': ts}),
+            'MISSING_SIGNATURE_HEADER')
+
+    def test_an_unconfigured_secret_never_reads_as_a_bad_signature(self):
+        os.environ.pop('COMPANION_CALLBACK_SECRET', None)
+        saved = {k: os.environ.pop(k, None) for k in
+                 ('COMPANION_CALLBACK_HMAC_SECRET', 'TRADEHOUSE_CALLBACK_HMAC_SECRET',
+                  'COMPANION_EXECUTOR_SECRET', 'EXECUTOR_SECRET')}
+        try:
+            self.assertEqual(th.callback_rejection_reason(b'{}', {}),
+                             'NO_CALLBACK_SECRET_CONFIGURED')
+        finally:
+            for k, v in saved.items():
+                if v is not None:
+                    os.environ[k] = v
+
+    def test_verification_is_not_softened_by_any_of_this(self):
+        """The whole point: naming the branch must not open one.
+
+        Every rejection reason must still produce False from the real verifier.
+        """
+        body = b'{}'
+        now = self._now_ms()
+        for headers in (
+            {},
+            {'x-executor-timestamp': str(now)},
+            {'x-executor-signature': 'abc'},
+            {'x-executor-timestamp': 'not-a-number', 'x-executor-signature': 'abc'},
+            {'x-executor-timestamp': str(now - th.CALLBACK_MAX_AGE_MS - 1),
+             'x-executor-signature': self._sign(body, now - th.CALLBACK_MAX_AGE_MS - 1)},
+            {'x-executor-timestamp': str(now), 'x-executor-signature': 'deadbeef'},
+        ):
+            with self.subTest(headers=sorted(headers)):
+                self.assertFalse(th.verify_callback_signature(body, headers))
+
+    def test_the_snapshot_publishes_the_counts_and_the_window(self):
+        body = b'{}'
+        ts = self._now_ms() - (th.CALLBACK_MAX_AGE_MS + 1000)
+        th.verify_callback_signature(body, {'x-executor-timestamp': str(ts),
+                                            'x-executor-signature': self._sign(body, ts)})
+        snap = th.delivery_snapshot()
+        self.assertEqual(snap['callback_rejections'].get('STALE_TIMESTAMP'), 1)
+        self.assertEqual(snap['callback_max_age_ms'], th.CALLBACK_MAX_AGE_MS)
