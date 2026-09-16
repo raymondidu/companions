@@ -1,56 +1,32 @@
 {
-  "captured_at_epoch": 1789524370.4598887,
-  "cleared_this_pass": [],
+  "captured_at_epoch": 1789588527.4146729,
+  "cleared_this_pass": [
+    "MARKET_NOT_RUNNING_SILVER",
+    "MARKET_NOT_RUNNING_USOIL",
+    "SCANS_NOT_ADVANCING",
+    "SILVER_NOT_REFUSED"
+  ],
   "lifecycle": {
-    "accepted": 69,
+    "accepted": 70,
     "closed_positions": 27,
     "closed_signals": 20,
-    "generated": 89,
-    "open_failed_positions": 808,
-    "open_failed_signals": 44,
-    "opened_positions": 47,
-    "opened_signals": 29,
-    "sent": 87
+    "generated": 90,
+    "open_failed_positions": 838,
+    "open_failed_signals": 46,
+    "opened_positions": 51,
+    "opened_signals": 33,
+    "sent": 88
   },
   "open_failure_reasons": {
-    "BELOW_MIN_CAPITAL": 55,
-    "BROKER_OPEN_FAILED": 553,
+    "BELOW_MIN_CAPITAL": 57,
+    "BROKER_OPEN_FAILED": 581,
     "COMPANION_INSUFFICIENT_CAPITAL_TO_STACK": 2,
     "INSTRUMENT_POSITION_OPEN": 1,
     "NO_BROKER": 1,
     "STALE_SIGNAL": 67,
     "UNSPECIFIED_OPEN_FAILURE": 129
   },
-  "open_faults": [
-    {
-      "always_alarms": false,
-      "code": "MARKET_NOT_RUNNING_SILVER",
-      "detail": "SILVER state is 'ERROR'",
-      "open_for_seconds": 0.0,
-      "since": 1789524370.4598887
-    },
-    {
-      "always_alarms": false,
-      "code": "MARKET_NOT_RUNNING_USOIL",
-      "detail": "USOIL state is 'ERROR'",
-      "open_for_seconds": 0.0,
-      "since": 1789524370.4598887
-    },
-    {
-      "always_alarms": false,
-      "code": "SCANS_NOT_ADVANCING",
-      "detail": "scans stuck at 3 since the previous reading",
-      "open_for_seconds": 335259.6,
-      "since": 1789189110.8423662
-    },
-    {
-      "always_alarms": true,
-      "code": "SILVER_NOT_REFUSED",
-      "detail": "SILVER gate is None, must be REFUSED_INSTRUMENT",
-      "open_for_seconds": 0.0,
-      "since": 1789524370.4598887
-    }
-  ],
-  "opening_stall_intervals": 2,
-  "scans": 3
+  "open_faults": [],
+  "opening_stall_intervals": 0,
+  "scans": 4
 }
