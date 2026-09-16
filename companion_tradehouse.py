@@ -26,8 +26,16 @@ POLICY_VERSION = "COMPANION_OILBTC_15LOCK10_STEP10_V1"
 # stops the trades and the mail they generate. Blocking only the scan would
 # leave this reachable by any other caller.
 #
-# One line to resume: set this False and redeploy.
-COMPANION_SCANNING_PAUSED = True
+# Owner instruction, 2026-09-16, verbatim: "let all go live now and start sending
+# trades", reaffirmed as "Turn it on do what I say". The pause is lifted.
+#
+# Every fail-closed check above the post is UNCHANGED and still runs first:
+# INVALID_DIRECTION, WRONG_COHORT, STALE_SIGNAL, EXECUTOR_UNCONFIGURED and
+# REFUSED_INSTRUMENT each answer for themselves before anything is sent. Lifting
+# this flag removes the owner's stop and nothing else.
+#
+# One line to stop again: set this True and redeploy.
+COMPANION_SCANNING_PAUSED = False
 
 COHORT = "EXNESS_SURVIVAL_V1"
 ACTIVE_PATHS = {

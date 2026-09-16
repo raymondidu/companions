@@ -1,4 +1,13 @@
-"""The owner said "Pause all scanning" on 2026-09-16. This proves companions is off.
+"""The owner pause is a MECHANISM, and this drives it both ways.
+
+The owner paused scanning on 2026-09-16 and lifted it the same day: "let all go
+live now and start sending trades". An earlier version of this file asserted
+COMPANION_SCANNING_PAUSED was True, which pinned that morning's state and went
+red the moment he changed his mind -- a test that fails because the owner made a
+decision is watching nothing. What must hold either way is the MECHANISM: while
+the flag is set nothing reaches the post, while it is clear a qualifying signal
+does, and the fail-closed gates above the post answer for themselves in BOTH
+positions.
 
 COMPANIONS IS NOT PAPER-ONLY, whatever its status payload says. scan_one emits
 'tradehouse_delivery': False and 'live_authority': False as literal labels in
@@ -70,13 +79,18 @@ def _deliver(market, **overrides):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-class CompanionPauseIsInForce(unittest.TestCase):
-    def test_the_pause_is_on(self):
-        self.assertTrue(
-            th.COMPANION_SCANNING_PAUSED,
-            'COMPANION_SCANNING_PAUSED is False; the owner paused scanning on '
-            '2026-09-16 and only he lifts it',
-        )
+class ThePauseStopsEveryLivePathWhenItIsSet(unittest.TestCase):
+    """Driven from a FORCED True, so it holds whichever way the flag ships."""
+
+    def setUp(self):
+        self._saved = th.COMPANION_SCANNING_PAUSED
+        th.COMPANION_SCANNING_PAUSED = True
+
+    def tearDown(self):
+        th.COMPANION_SCANNING_PAUSED = self._saved
+
+    def test_the_flag_is_a_real_boolean(self):
+        self.assertIsInstance(th.COMPANION_SCANNING_PAUSED, bool)
 
     def test_delivery_refuses_before_it_can_reach_the_executor(self):
         """Every live path, including the ones that would otherwise qualify."""
@@ -110,12 +124,52 @@ class CompanionPauseIsInForce(unittest.TestCase):
             'the pause swallowed a fail-closed direction check',
         )
 
+    def test_the_fail_closed_gates_answer_with_the_pause_LIFTED_too(self):
+        """The reason the pause sits on the post and not at the top.
+
+        These are trading-authority gates. They have to hold when the owner is
+        live, which is precisely when nothing else is stopping a bad signal.
+        Asserting them only while paused proves the cheap half.
+        """
+        saved = th.COMPANION_SCANNING_PAUSED
+        th.COMPANION_SCANNING_PAUSED = False
+        self.addCleanup(lambda: setattr(th, 'COMPANION_SCANNING_PAUSED', saved))
+
+        out = asyncio.run(th.deliver_selected_signal('NOT_A_MARKET', {}))
+        self.assertEqual(out['status'], 'REFUSED_INSTRUMENT')
+
+        market = next(iter(th.ACTIVE_PATHS))
+        bad = _deliver(market, live_candidate={
+            'direction': 'BUY',
+            'created_at': datetime.now(timezone.utc).isoformat(),
+        })
+        self.assertEqual(
+            bad['status'], 'INVALID_DIRECTION',
+            'a fail-closed direction check stopped answering once the pause was '
+            'lifted, which is exactly when it matters',
+        )
+
+        stale = _deliver(market, live_candidate={
+            'direction': 'LONG',
+            'created_at': '2020-01-01T00:00:00+00:00',
+        })
+        self.assertEqual(
+            stale['status'], 'STALE_SIGNAL',
+            'the staleness gate stopped answering once the pause was lifted',
+        )
+
 
 class ThePauseIsReversible(unittest.TestCase):
     """CONTROL. Without this the suite would pass against a hardcoded refusal."""
 
+    def setUp(self):
+        self._saved = th.COMPANION_SCANNING_PAUSED
+
     def tearDown(self):
-        th.COMPANION_SCANNING_PAUSED = True
+        # RESTORE what was there, never hardcode a value: a tearDown that sets
+        # True would silently flip the module for every later test the day the
+        # owner ships it False.
+        th.COMPANION_SCANNING_PAUSED = self._saved
 
     def test_the_fixture_never_writes_outside_a_temp_dir(self):
         """Pins the fix for a CI-only failure this file actually caused.
