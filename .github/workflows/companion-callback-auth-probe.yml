@@ -58,12 +58,33 @@ jobs:
             # dashboard over HTTP and reports UNREADABLE if it cannot answer.
             # /health has been timing out for days under the callback flood; the
             # executor says that is fixed, so this also measures whether it is.
-            if curl --connect-timeout 5 --max-time 25 -fsS http://127.0.0.1:8082/health \
-                 -o /tmp/companion_health.json 2>/dev/null; then
-              echo "COMPANION_HEALTH_READ ok"
+            # NO -f AND NO 2>/dev/null. Both throw away the answer. -f discards
+            # the body on a non-2xx and this probe printed "did not answer in
+            # 25s" for EVERY failure, including a 500 that answered instantly
+            # with its reason in the body -- the same mistake that hid gold's
+            # 503 reason=TimeoutError and the 28MB byte count in the companions
+            # deploy log. A timeout and a served error are different faults and
+            # must not print the same sentence.
+            health_err=/tmp/companion_health.err
+            health_code=$(curl --connect-timeout 5 --max-time 25 -sS \
+              -o /tmp/companion_health.json -w '%{http_code}' \
+              http://127.0.0.1:8082/health 2>"$health_err") || health_code=000
+            health_bytes=$(wc -c < /tmp/companion_health.json 2>/dev/null || echo 0)
+            if [ "$health_code" = "200" ]; then
+              echo "COMPANION_HEALTH_READ ok http=200 bytes=${health_bytes}"
+            elif [ "$health_code" = "000" ]; then
+              echo "COMPANION_HEALTH_READ UNREADABLE no HTTP status: $(tr '\n' ' ' < "$health_err" | cut -c1-300)"
+              echo "  bytes_received=${health_bytes}. If that is non-zero the body was"
+              echo "  still arriving when the 25s ran out, which is a SIZE problem, not a"
+              echo "  dead process. The live rejection counters below are UNAVAILABLE,"
+              echo "  not zero."
+              : > /tmp/companion_health.json
             else
-              echo "COMPANION_HEALTH_READ UNREADABLE /health did not answer in 25s -- the"
-              echo "  live rejection counters below are UNAVAILABLE, not zero."
+              echo "COMPANION_HEALTH_READ UNREADABLE http=${health_code} bytes=${health_bytes}"
+              echo "  body: $(head -c 300 /tmp/companion_health.json | tr '\n' ' ')"
+              echo "  /health ANSWERED and refused. That is a served error, not a"
+              echo "  timeout. The live rejection counters below are UNAVAILABLE, not"
+              echo "  zero."
               : > /tmp/companion_health.json
             fi
 

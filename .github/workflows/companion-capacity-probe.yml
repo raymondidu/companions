@@ -1,0 +1,150 @@
+name: Companion Capacity Probe
+
+# READ-AND-LOG ONLY. This is the ENTIRE v1 of the capacity signal on our side.
+#
+# THE OWNER'S CONDITION, VERBATIM: "a yes here is zero-risk as long as it stays
+# read-and-log." So this reads the executor's capacity endpoint and PRINTS it.
+# Nothing in the sending path consults it, imports it, or can be blocked by it.
+# A capacity check that ever decides whether we send is a NEW GATE and needs the
+# owner's words, not an increment.
+#
+# It is dispatch-only and deliberately NOT scheduled: polling an endpoint we act
+# on for nothing is waste, and a cadence should be chosen when there is something
+# to act on.
+#
+# WHAT THEIR CONTRACT SAYS, and how this reads it:
+#  - once authed it ALWAYS returns HTTP 200, so 200 is NOT success here. The body
+#    decides. A non-200 is itself worth printing rather than retrying away.
+#  - on an internal error the body is {ok:false, capacity:{}}. An EMPTY capacity
+#    map beside ok:false is UNKNOWN and must never be read as "zero capacity".
+#    That distinction is the whole reason this probe has a third verdict.
+#  - the headline number is DISTINCT USERS with a free eligible account, because
+#    they fan out one position per user per signal. Raw account counts live in
+#    detail.accounts_free. Those are different numbers and must not be swapped.
+#  - there is NO as_of field, so staleness is UNDETECTABLE from the payload.
+#    They say the wallet set is cached ~20s. We cannot verify that from here and
+#    this probe says so rather than implying freshness it cannot see.
+#
+# NO SECRET VALUE IS EMITTED. The secret is read from the box's own .env by NAME
+# and used to sign the request; only its name and length are ever printed.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: companion-capacity-probe
+  cancel-in-progress: true
+
+jobs:
+  capacity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: Read the executor's capacity signal, and act on nothing
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.DO_HOST }}
+          username: ${{ secrets.DO_USER }}
+          key: ${{ secrets.DO_SSH_KEY }}
+          port: 22
+          command_timeout: 5m
+          script: |
+            set -uo pipefail
+            cd /home/companions
+
+            # Names and lengths only. The value is used to sign the request and
+            # never printed, the same rule that kept the OANDA work safe.
+            secret="$(awk -F= '$1=="COMPANION_EXECUTOR_SECRET"{sub(/^[^=]*=/,"");print;exit}' .env)"
+            base="$(awk -F= '$1=="COMPANION_EXECUTOR_BASE_URL"{sub(/^[^=]*=/,"");print;exit}' .env)"
+            base="${base:-https://tradehouse.app}"
+            echo "COMPANION_CAPACITY_AUTH name=COMPANION_EXECUTOR_SECRET present=$([ -n "$secret" ] && echo true || echo false) length=${#secret}"
+            echo "COMPANION_CAPACITY_URL ${base}/api/companion/capacity"
+            if [ -z "$secret" ]; then
+              echo "COMPANION_CAPACITY_VERDICT UNREADABLE the outbound secret is absent from"
+              echo "  this box's .env, so nothing was requested. That is OUR configuration,"
+              echo "  not a statement about their capacity."
+              exit 0
+            fi
+
+            # NO -f. It discards the body on a non-2xx, and their contract puts the
+            # answer IN THE BODY. That mistake has cost this project twice today.
+            code=$(curl -sS -o /tmp/capacity.json -w '%{http_code}' \
+              --connect-timeout 10 --max-time 30 \
+              -H "x-executor-secret: ${secret}" \
+              "${base}/api/companion/capacity" || echo 000)
+            unset secret
+            echo "COMPANION_CAPACITY_HTTP ${code}"
+
+            python3 - "$code" <<'PYCAP' || echo "COMPANION_CAPACITY_VERDICT UNREADABLE probe parse failed"
+            import json, sys
+
+            code = sys.argv[1]
+            try:
+                body = json.load(open('/tmp/capacity.json'))
+            except Exception as exc:
+                print('COMPANION_CAPACITY_VERDICT UNREADABLE body did not parse (%s). '
+                      'Nothing here says anything about capacity.' % type(exc).__name__)
+                raise SystemExit(0)
+
+            print('COMPANION_CAPACITY_BODY %s'
+                  % json.dumps(body, sort_keys=True, default=str)[:900])
+
+            ok = body.get('ok')
+            capacity = body.get('capacity')
+            if capacity is None and isinstance(body, dict):
+                # Tolerate a top-level shape too rather than reporting UNKNOWN on a
+                # payload we simply did not anticipate.
+                capacity = {k: v for k, v in body.items() if isinstance(v, int)}
+
+            # THREE-WAY, and the middle one is the point. Their own contract says an
+            # internal error returns ok:false with an EMPTY capacity map, which is
+            # indistinguishable from real zeros if you only look at the numbers.
+            if code != '200':
+                print('COMPANION_CAPACITY_VERDICT UNEXPECTED_STATUS %s -- their contract '
+                      'says an authed call always returns 200, so this is worth reading '
+                      'rather than retrying away.' % code)
+            elif ok is False or not isinstance(capacity, dict) or not capacity:
+                print('COMPANION_CAPACITY_VERDICT UNKNOWN ok=%r capacity=%r -- their '
+                      'documented internal-error shape. This is NOT "no capacity"; it is '
+                      '"they could not tell us". Never read it as zero.' % (ok, capacity))
+            else:
+                # Their keys are EXECUTOR instrument names. Ours are market keys, and
+                # EXECUTOR_INSTRUMENT maps BTC -> BTCUSD, so a naive join would silently
+                # drop BTC. Report both names rather than quietly renaming anything.
+                ours = {'USOIL': 'USOIL', 'BTCUSD': 'BTC'}
+                lines, unknown = [], []
+                for key, value in sorted(capacity.items()):
+                    mapped = ours.get(str(key))
+                    if mapped is None:
+                        unknown.append(str(key))
+                    lines.append('%s(ours:%s)=%s' % (key, mapped or 'UNMAPPED', value))
+                print('COMPANION_CAPACITY_BY_INSTRUMENT %s' % ' '.join(lines))
+                if unknown:
+                    print('COMPANION_CAPACITY_UNMAPPED %s -- present in their payload and '
+                          'not in our EXECUTOR_INSTRUMENT map. Not an error; just do not '
+                          'assume it corresponds to one of our markets.' % unknown)
+                missing = [k for k in ours if k not in capacity]
+                if missing:
+                    print('COMPANION_CAPACITY_ABSENT %s -- omitted from their payload, '
+                          'which per the agreed shape means UNKNOWN, not zero.' % missing)
+                detail = body.get('detail') or {}
+                if isinstance(detail, dict) and 'accounts_free' in detail:
+                    print('COMPANION_CAPACITY_ACCOUNTS_FREE %s -- RAW ACCOUNTS, a different '
+                          'number from the headline DISTINCT USERS above. Do not swap them.'
+                          % json.dumps(detail.get('accounts_free'), sort_keys=True,
+                                       default=str)[:300])
+                print('COMPANION_CAPACITY_VERDICT READ ok=%r instruments=%d' % (ok, len(capacity)))
+
+            # Said on every run, not buried in a comment, because the next reader
+            # will be tempted to wire this in.
+            print('COMPANION_CAPACITY_USE READ-AND-LOG ONLY. Nothing in the sending '
+                  'path consults this. Making it a gate is the owner\'s decision in '
+                  'words, not an increment.')
+            print('COMPANION_CAPACITY_STALENESS NOT_VERIFIABLE the payload carries no '
+                  'as_of, so this probe cannot tell a fresh read from a cached one. '
+                  'Their stated cache is ~20s and we cannot confirm that from here.')
+            PYCAP
+            echo "COMPANION_CAPACITY_COMPLETE"
