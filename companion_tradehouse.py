@@ -130,7 +130,40 @@ def _callback_position_rows(callbacks: dict):
             yield signal_id, str(signal.get("tradehouse_id") or signal_id), signal
 
 
-def delivery_snapshot() -> dict:
+def delivery_snapshot(ledger: str = 'full') -> dict:
+    """The execution-truth snapshot. `ledger` decides how much of it travels.
+
+    THREE MODES, because the three callers need genuinely different amounts:
+      'full'   -- everything. /api/companion/tradehouse, for detail reads.
+      'none'   -- omit signals and callbacks entirely. /health, whose consumers
+                  were each checked and read neither.
+      'latest' -- only the newest signal per market and that signal's callback.
+                  /api/markets, because the dashboard only ever uses those: its
+                  latestSignal() filters by market, sorts by attempted_at desc
+                  and takes [0], and lifecycle() looks up exactly that one
+                  signal_id. Sending only the newest per market is therefore
+                  BEHAVIOURALLY IDENTICAL to the page, with no JS change.
+
+    MEASURED 2026-09-16: `signals` and `callbacks` carry the whole delivery and
+    callback ledgers inline, and /health returned a 28,348,272-byte body because
+    of them. curl --max-time 5, which is what the deploy verifier uses, got
+    23,884,760 of those bytes and gave up, so every companion deploy failed its
+    own health check and companion-telemetry failed 11 of 13 runs. Nothing was
+    wrong with the box; the payload was simply unfetchable.
+
+    NOTHING THAT READS /health NEEDS THEM. Checked before trimming, not assumed:
+    the deploy verifier reads executor_configured and live_enable_requested, the
+    callback auth probe reads callback_rejections, and
+    .github/scripts/companion_health_assert.py reads summary, lifecycle,
+    open_failure_reasons, markets and live_signal_gate -- zero references to
+    `callbacks`, and every `signals` hit is opened_signals or closed_signals
+    INSIDE summary. The dashboard does need both, and it reads /api/markets,
+    which is left untouched.
+
+    THE COUNTS REPLACE THEM RATHER THAN THE KEYS JUST VANISHING. A field that
+    silently disappears reads as zero to whatever consumed it next, which is the
+    fault this file has been chasing all day.
+    """
     state = _read(_state_path())
     # WHY CALLBACKS ARE BEING TURNED AWAY, not just how many. Without this the
     # only visible symptom is 401s in an access log, which cannot separate a
@@ -209,7 +242,7 @@ def delivery_snapshot() -> dict:
         "open_failed_positions": len(failed_rows),
         "open_failed_signals": len(failed_signal_ids),
     }
-    return {
+    out = {
         "policy_version": POLICY_VERSION,
         "cohort": COHORT,
         "active_paths": ACTIVE_PATHS,
@@ -231,6 +264,42 @@ def delivery_snapshot() -> dict:
         "signals": signals,
         "callbacks": callback_signals,
     }
+    if ledger == "none":
+        out.pop("signals", None)
+        out.pop("callbacks", None)
+        out["ledger_omitted"] = {
+            "reason": "these two keys are the whole ledger and made /health a 28MB body",
+            "mode": "none",
+            "signals_count": len(signals or {}),
+            "callback_signals_count": len(callback_signals or {}),
+            "full_payload_at": "/api/companion/tradehouse",
+        }
+    elif ledger == "latest":
+        # Newest per market, by the same key the page sorts on.
+        newest: dict[str, tuple[str, str]] = {}
+        for sid, sig in (signals or {}).items():
+            if not isinstance(sig, dict):
+                continue
+            market = str(sig.get("market") or "")
+            stamp = str(sig.get("attempted_at") or sig.get("updated_at") or "")
+            current = newest.get(market)
+            if current is None or stamp > current[1]:
+                newest[market] = (sid, stamp)
+        keep = {sid for sid, _ in newest.values()}
+        out["signals"] = {k: v for k, v in (signals or {}).items() if k in keep}
+        out["callbacks"] = {k: v for k, v in (callback_signals or {}).items()
+                            if k in keep}
+        out["ledger_omitted"] = {
+            "reason": "the dashboard only reads the newest signal per market and "
+                      "its callback; the full ledger made this a 28MB body and the "
+                      "page could not finish loading",
+            "mode": "latest",
+            "signals_count": len(signals or {}),
+            "signals_kept": len(out["signals"]),
+            "callback_signals_count": len(callback_signals or {}),
+            "full_payload_at": "/api/companion/tradehouse",
+        }
+    return out
 
 
 def _signal_id(market_key: str, path: str, setup_key: str, candidate: dict) -> str:
