@@ -21,9 +21,12 @@ name: Companion Capacity Probe
 #  - the headline number is DISTINCT USERS with a free eligible account, because
 #    they fan out one position per user per signal. Raw account counts live in
 #    detail.accounts_free. Those are different numbers and must not be swapped.
-#  - there is NO as_of field, so staleness is UNDETECTABLE from the payload.
-#    They say the wallet set is cached ~20s. We cannot verify that from here and
-#    this probe says so rather than implying freshness it cannot see.
+#  - the payload DOES carry as_of (and a duplicate 'timestamp'). An earlier
+#    version of this file said it did not and printed that on every run; the
+#    first live run disproved it. The age is computed against OUR clock, so it
+#    BOUNDS staleness and never proves freshness: a large value can be their
+#    cache or skew between two boxes. Absent field, and only then, reads
+#    NOT_VERIFIABLE.
 #
 # NO SECRET VALUE IS EMITTED. The secret is read from the box's own .env by NAME
 # and used to sign the request; only its name and length are ever printed.
@@ -130,12 +133,41 @@ jobs:
                 if missing:
                     print('COMPANION_CAPACITY_ABSENT %s -- omitted from their payload, '
                           'which per the agreed shape means UNKNOWN, not zero.' % missing)
+                # THE LIVE SHAPE PUT accounts_free ONE LEVEL DEEPER THAN I READ IT.
+                # detail is keyed by instrument -- {'USOIL': {'accounts_free': 24,
+                # 'users_free': 23, 'known': True}} -- so the first version of this
+                # probe looked for a top-level 'accounts_free', found none, and
+                # printed NEITHER number. The whole point of this block is that the
+                # headline is DISTINCT USERS and accounts_free is RAW ACCOUNTS, and
+                # it was silently printing neither. Measured, not assumed: first run
+                # 20:02 read USOIL accounts_free 24 against users_free 23.
                 detail = body.get('detail') or {}
-                if isinstance(detail, dict) and 'accounts_free' in detail:
-                    print('COMPANION_CAPACITY_ACCOUNTS_FREE %s -- RAW ACCOUNTS, a different '
-                          'number from the headline DISTINCT USERS above. Do not swap them.'
-                          % json.dumps(detail.get('accounts_free'), sort_keys=True,
-                                       default=str)[:300])
+                if isinstance(detail, dict):
+                    for key in sorted(detail):
+                        row = detail.get(key)
+                        if not isinstance(row, dict):
+                            continue
+                        print('COMPANION_CAPACITY_DETAIL %s users_free=%s accounts_free=%s '
+                              'known=%s -- users_free is the HEADLINE (one open per user '
+                              'per signal); accounts_free is RAW ACCOUNTS and is a '
+                              'different number. Do not swap them.'
+                              % (key, row.get('users_free'), row.get('accounts_free'),
+                                 row.get('known')))
+                        # If the headline disagrees with its own detail row, the
+                        # payload is internally inconsistent and neither number should
+                        # be quoted as fact.
+                        if 'users_free' in row and capacity.get(key) != row.get('users_free'):
+                            print('COMPANION_CAPACITY_INCONSISTENT %s capacity=%r but '
+                                  'detail.users_free=%r -- their payload disagrees with '
+                                  'itself. Quote neither.'
+                                  % (key, capacity.get(key), row.get('users_free')))
+                        if row.get('known') is False:
+                            print('COMPANION_CAPACITY_WALLETS_UNKNOWN %s -- they could not '
+                                  'resolve the wallet set for this instrument, so the '
+                                  'number beside it is not a measurement.' % key)
+                if body.get('wallets_known') is False:
+                    print('COMPANION_CAPACITY_WALLETS_UNKNOWN ALL -- top-level '
+                          'wallets_known is false. Treat every number above as UNKNOWN.')
                 print('COMPANION_CAPACITY_VERDICT READ ok=%r instruments=%d' % (ok, len(capacity)))
 
             # Said on every run, not buried in a comment, because the next reader
@@ -143,8 +175,32 @@ jobs:
             print('COMPANION_CAPACITY_USE READ-AND-LOG ONLY. Nothing in the sending '
                   'path consults this. Making it a gate is the owner\'s decision in '
                   'words, not an increment.')
-            print('COMPANION_CAPACITY_STALENESS NOT_VERIFIABLE the payload carries no '
-                  'as_of, so this probe cannot tell a fresh read from a cached one. '
-                  'Their stated cache is ~20s and we cannot confirm that from here.')
+            # THE FIRST VERSION SAID "the payload carries no as_of" UNCONDITIONALLY,
+            # AND THE FIRST LIVE RUN DISPROVED IT: as_of was right there,
+            # 2026-09-16T20:02:21.775Z, alongside a duplicate 'timestamp'. A probe
+            # that prints a fixed sentence about the payload is not reading the
+            # payload. It reads the field now and only says NOT_VERIFIABLE when the
+            # field is genuinely absent.
+            stamp = body.get('as_of') or body.get('timestamp')
+            if stamp:
+                try:
+                    import datetime as _dt
+                    text = str(stamp).replace('Z', '+00:00')
+                    when = _dt.datetime.fromisoformat(text)
+                    if when.tzinfo is None:
+                        when = when.replace(tzinfo=_dt.timezone.utc)
+                    age = (_dt.datetime.now(_dt.timezone.utc) - when).total_seconds()
+                    print('COMPANION_CAPACITY_AS_OF %s age_s=%.1f -- age is against OUR '
+                          'clock, so a large value can be their staleness OR skew '
+                          'between two boxes. It bounds staleness, it does not prove '
+                          'freshness.' % (stamp, age))
+                except Exception as exc:
+                    print('COMPANION_CAPACITY_AS_OF %s UNPARSEABLE (%s) -- the field is '
+                          'present and this probe could not read it, which is not the '
+                          'same as absent.' % (stamp, type(exc).__name__))
+            else:
+                print('COMPANION_CAPACITY_STALENESS NOT_VERIFIABLE no as_of and no '
+                      'timestamp in this payload, so a fresh read and a cached one are '
+                      'indistinguishable from here.')
             PYCAP
             echo "COMPANION_CAPACITY_COMPLETE"
