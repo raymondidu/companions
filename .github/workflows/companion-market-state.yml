@@ -1,0 +1,123 @@
+name: Companion Market State
+
+# READ-ONLY. Changes nothing, sends nothing, cannot place or close a trade.
+#
+# WHY THIS EXISTS. Every existing companion instrument reads the dashboard's
+# /health, and that endpoint has been unanswerable all day: 25s timeouts on
+# 2026-09-16 at 14:54 and 16:44, and a 6m09s failure at 15:11 even with a 120s
+# budget and retries. So the one question that matters -- is USOIL pulling
+# candles, and is BTC producing anything -- has been unanswerable for three days
+# for a reason that has nothing to do with the markets.
+#
+# The scanner already writes everything needed to
+# $COMPANION_DATA_DIR/<market>_status.json on every scan. This reads those files
+# directly inside the RUNNING scanner container, so it does not touch the
+# dashboard, does not depend on uvicorn having a free worker, and cannot be
+# blocked by the callback flood that is pinning that process.
+#
+# A CONTAINER RECREATE DOES NOT CLEAR THAT FLOOD. Measured: the containers were
+# recreated at ~16:4x for the OANDA token and the 200/401 callback mix resumed
+# immediately, so the senders are external and persistent, not stuck internal
+# state. An earlier note claiming a deploy would clear it was wrong.
+#
+# NOTHING SECRET IS EMITTED. State, candle counts, timestamps and a truncated
+# error string only. No token, no account id, no payloads.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: companion-market-state
+  cancel-in-progress: true
+
+jobs:
+  state:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: Read each market's state from the scanner itself
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.DO_HOST }}
+          username: ${{ secrets.DO_USER }}
+          key: ${{ secrets.DO_SSH_KEY }}
+          port: 22
+          timeout: 45s
+          command_timeout: 5m
+          script: |
+            set -uo pipefail
+            cd /home/companions
+            pwd
+
+            # exec into the ALREADY RUNNING scanner, never `run`: this host has
+            # been measured at 88.5% memory with zero swap and starting another
+            # container is how a probe causes the next outage.
+            timeout 120 docker compose exec -T companion-scanner python3 - <<'PYSTATE' || echo "COMPANION_MARKET_STATE UNREADABLE_OR_TIMED_OUT this says nothing about the markets"
+            import json, os
+            from pathlib import Path
+
+            data_dir = Path(os.getenv('COMPANION_DATA_DIR', '/app/companion-data'))
+            print('COMPANION_DATA_DIR %s exists=%s' % (data_dir, data_dir.is_dir()))
+            if not data_dir.is_dir():
+                print('COMPANION_MARKET_STATE NO_DATA_DIR'); raise SystemExit(0)
+
+            found = sorted(p.name for p in data_dir.glob('*_status.json'))
+            print('COMPANION_STATUS_FILES %s' % found)
+            if not found:
+                print('COMPANION_MARKET_STATE NO_STATUS_FILES the scanner has not '
+                      'written one yet; that is a scanner fault, not a market one')
+                raise SystemExit(0)
+
+            live = []
+            for name in found:
+                try:
+                    d = json.loads((data_dir / name).read_text())
+                except Exception as e:
+                    print('COMPANION_MARKET file=%s UNPARSEABLE %s' % (name, type(e).__name__))
+                    continue
+                bars = d.get('data') or {}
+                # An empty error is normal; a present one is the whole answer.
+                err = str(d.get('error') or '')[:200]
+                print('COMPANION_MARKET market=%s state=%s ok=%s provider_symbol=%s '
+                      'scan_count=%s m15=%s h1=%s h4=%s last_scan=%s error=%s'
+                      % (d.get('market'), d.get('state'), d.get('ok'),
+                         d.get('provider_symbol'), d.get('scan_count'),
+                         bars.get('m15_candles'), bars.get('h1_candles'),
+                         bars.get('h4_candles'),
+                         d.get('last_scan_completed_at'), err or 'NONE'))
+                # Live-eligibility and what the gate said, so a healthy market
+                # that still delivers nothing is distinguishable from a dead one.
+                gate = d.get('live_signal_gate') or {}
+                print('COMPANION_MARKET_GATE market=%s live_authority=%s '
+                      'tradehouse_delivery=%s candidate=%s gate_reason=%s'
+                      % (d.get('market'), d.get('live_authority'),
+                         bool(d.get('tradehouse_delivery')),
+                         bool(d.get('live_signal_candidate')),
+                         str(gate.get('reason') or gate.get('state') or 'NONE')[:120]))
+                if d.get('market') in ('USOIL', 'BTC'):
+                    live.append(d)
+
+            # THE VERDICT IS ABOUT DATA, NOT ABOUT TRADING. Scanning is paused by
+            # the owner, so "not delivering" is expected and is NOT a fault. What
+            # this probe answers is whether each market can SEE the market at all.
+            for d in live:
+                m, state = d.get('market'), str(d.get('state') or '')
+                bars = d.get('data') or {}
+                got = bars.get('m15_candles')
+                if state == 'RUNNING' and got:
+                    print('COMPANION_VERDICT %s READING_THE_MARKET %s m15 candles on the '
+                          'last scan. Data is healthy. Whether it DELIVERS is a separate '
+                          'question and is governed by the owner pause.' % (m, got))
+                elif state == 'ERROR':
+                    print('COMPANION_VERDICT %s CANNOT_READ_THE_MARKET state=ERROR '
+                          'error=%s -- upstream of every gate, so no candidate can exist'
+                          % (m, str(d.get('error') or '')[:200]))
+                else:
+                    print('COMPANION_VERDICT %s state=%s with m15=%s. Not an error and '
+                          'not proven healthy; read the error and scan_count above.'
+                          % (m, state or 'UNSET', got))
+            PYSTATE
+            echo "COMPANION_MARKET_STATE_COMPLETE"
