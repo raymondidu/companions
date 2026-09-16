@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -528,3 +529,38 @@ def record_callback(payload: dict) -> tuple[bool, str]:
     signals[signal_id] = sig
     _write(_callback_path(), state)
     return True, "RECORDED"
+
+
+# THE CALLBACK LEDGER IS 34.5 MB AND record_callback REWRITES ALL OF IT.
+# Measured on the box 2026-09-16 18:48: tradehouse_callbacks.json is
+# 34,496,030 bytes across 71 signals and 956 position rows. record_callback
+# does a full _read at the top and a full _write at the bottom, both
+# synchronous, and companion_app awaited it directly inside `async def
+# tradehouse_callback`. So EVERY inbound callback parsed, re-serialised and
+# rewrote 34.5 MB ON THE EVENT LOOP, which stalls the whole process: no other
+# request can be accepted or answered while it runs. That is why /health has
+# been unanswerable for days, why a container recreate never helped (the file
+# lives on the volume and survives), and why the dashboard sat at 90-97% CPU.
+#
+# I FIRST BLAMED delivery_snapshot() AND MEASURED IT INSTEAD OF SHIPPING THE
+# GUESS: 585 ms, nowhere near the 25 s timeouts, and /health is a plain `def`
+# so FastAPI already runs it in a threadpool. The probe said
+# AGGREGATION_IS_NOT_THE_COST and it was right. This is the cost.
+#
+# THE LOCK IS NOT OPTIONAL. Running record_callback in a thread without one
+# would be worse than the bug: the event loop was serialising these
+# read-modify-write cycles for free, and threads would let two callbacks read
+# the same state and the second overwrite the first, silently losing a real
+# trade event. The lock keeps the exact ordering guarantee the loop gave while
+# freeing the loop itself.
+#
+# Nothing about verification, admission or recording changes. This moves WHERE
+# record_callback runs, not WHAT it does; verify_callback_signature still runs
+# fail-closed before it, untouched.
+_CALLBACK_RECORD_LOCK = asyncio.Lock()
+
+
+async def record_callback_async(payload: dict) -> tuple[bool, str]:
+    """record_callback, off the event loop and still strictly serialised."""
+    async with _CALLBACK_RECORD_LOCK:
+        return await asyncio.to_thread(record_callback, payload)
