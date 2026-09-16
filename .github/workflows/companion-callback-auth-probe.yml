@@ -182,4 +182,54 @@ jobs:
                         print('COMPANION_CALLBACK_VERDICT NO_CALLBACKS_SEEN since this '
                               'process started. Says nothing either way.')
             PYAUTH
+
+            # WHY /health IS SLOW, measured rather than attributed. The executor
+            # reports the callback storm stopped and /health recovered; at
+            # 18:39:47 on 2026-09-16, right after a fresh deploy, it still did
+            # not answer in 25 seconds. Before telling them their fix did not
+            # work, rule out the other explanation: /health calls
+            # delivery_snapshot() on EVERY request, which reads the whole
+            # callback ledger and walks every position row. If that ledger is
+            # large, /health is slow BY CONSTRUCTION and no amount of stopping
+            # the flood fixes it.
+            #
+            # Timed inside the SCANNER, which shares the data volume, so this
+            # adds no load to the dashboard process it is diagnosing.
+            timeout 120 docker compose exec -T companion-scanner python3 - <<'PYCOST' || echo "COMPANION_HEALTH_COST UNREADABLE_OR_TIMED_OUT"
+            import os, time
+            from pathlib import Path
+
+            d = Path(os.getenv('COMPANION_DATA_DIR', '/app/companion-data'))
+            for name in ('tradehouse_callbacks.json', 'tradehouse_delivery.json'):
+                p = d / name
+                print('COMPANION_LEDGER file=%s exists=%s bytes=%s'
+                      % (name, p.is_file(), p.stat().st_size if p.is_file() else 0))
+
+            try:
+                import companion_tradehouse as ct
+                t0 = time.monotonic()
+                snap = ct.delivery_snapshot()
+                cost_ms = (time.monotonic() - t0) * 1000.0
+                cb = ct._read(ct._callback_path())
+                signals = len(cb.get('signals') or {})
+                rows = sum(1 for _ in ct._callback_position_rows(cb))
+                print('COMPANION_HEALTH_COST delivery_snapshot_ms=%.0f signals=%d '
+                      'position_rows=%d' % (cost_ms, signals, rows))
+                # One reading is one reading. State the threshold being compared
+                # against rather than implying a trend from a single sample.
+                if cost_ms > 5000:
+                    print('COMPANION_HEALTH_VERDICT AGGREGATION_IS_THE_COST %.1fs for a '
+                          'single delivery_snapshot(), and /health calls it on every '
+                          'request. That is why it times out, and stopping the inbound '
+                          'flood does not fix it.' % (cost_ms / 1000.0))
+                else:
+                    print('COMPANION_HEALTH_VERDICT AGGREGATION_IS_NOT_THE_COST '
+                          '%.0fms for a single delivery_snapshot(), well inside the '
+                          'budget. If /health still times out, the cost is elsewhere '
+                          '-- inbound load or the event loop -- not this read.'
+                          % cost_ms)
+            except Exception as e:
+                print('COMPANION_HEALTH_COST UNREADABLE %s: %s -- no timing was taken, '
+                      'which is not the same as fast.' % (type(e).__name__, str(e)[:160]))
+            PYCOST
             echo "COMPANION_CALLBACK_AUTH_COMPLETE"
