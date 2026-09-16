@@ -12,6 +12,23 @@ from typing import Any
 import httpx
 
 POLICY_VERSION = "COMPANION_OILBTC_15LOCK10_STEP10_V1"
+# OWNER PAUSE, 2026-09-16: "Pause all scanning."
+#
+# Companions is NOT paper-only, whatever its status payload says. scan_one emits
+# 'tradehouse_delivery': False and 'live_authority': False as literal labels in
+# the output dict, while companion_runner.py:149 calls deliver_selected_signal
+# on EVERY scan and this module posts to the executor with x-executor-secret.
+# A field that reports a delivery path as off while the code below delivers is
+# the instrument lying about the thing it exists to report.
+#
+# So the pause is enforced HERE, at the post, and not only at the scan: it is
+# the last thing between a signal and a real order, and stopping it is what
+# stops the trades and the mail they generate. Blocking only the scan would
+# leave this reachable by any other caller.
+#
+# One line to resume: set this False and redeploy.
+COMPANION_SCANNING_PAUSED = True
+
 COHORT = "EXNESS_SURVIVAL_V1"
 ACTIVE_PATHS = {
     "USOIL": "BALANCED_CLEAN",
@@ -264,6 +281,26 @@ async def deliver_selected_signal(
     internal_direction = str(live_candidate.get("direction") or "").upper()
     if internal_direction not in {"LONG", "SHORT"}:
         return {"eligible": False, "sent": False, "status": "INVALID_DIRECTION", "signal_id": signal_id, "path": path}
+
+    if COMPANION_SCANNING_PAUSED:
+        # Owner pause, sitting DIRECTLY on the post and deliberately not at the
+        # top of this function.
+        #
+        # First placement was the top, and it broke ten routing-contract tests
+        # by answering PAUSED_BY_OWNER where they require INVALID_DIRECTION,
+        # WRONG_COHORT, STALE_SIGNAL, EXECUTOR_UNCONFIGURED or
+        # REFUSED_INSTRUMENT. Those are fail-closed trading gates and making
+        # them unreachable is softening them, which is never allowed -- they
+        # still have to hold the day the pause is lifted.
+        #
+        # Here, every one of those refusals runs first and returns its own
+        # status, and the pause catches only what would otherwise have been
+        # SENT. Nothing can reach the post: this is the last statement before
+        # the payload is built.
+        return {
+            "eligible": True, "sent": False, "status": "PAUSED_BY_OWNER",
+            "signal_id": signal_id, "path": path,
+        }
 
     # TradeHouse Companion ingest contract requires LONG/SHORT exactly.
     # Keep internal strategy semantics unchanged and send them through verbatim.
