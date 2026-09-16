@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
 from companion_markets import MARKETS, isolation_contract
-from companion_tradehouse import delivery_snapshot, record_callback, verify_callback_signature
+from companion_tradehouse import delivery_snapshot, record_callback_async, verify_callback_signature
 
 DATA_DIR=Path(os.getenv('COMPANION_DATA_DIR','/app/companion-data'))
 app=FastAPI(title='Isolated Companion Markets Research')
@@ -64,7 +64,11 @@ async def tradehouse_callback(request: Request):
         payload=json.loads(body.decode('utf-8'))
     except Exception:
         raise HTTPException(status_code=400,detail='INVALID_JSON')
-    ok,reason=record_callback(payload)
+    # AWAITED, NOT CALLED. record_callback rewrites a 34.5 MB ledger; running it
+    # inline on the event loop blocked every other request in the process,
+    # which is why /health could not answer. record_callback_async keeps the
+    # serialisation the loop was providing and gives the loop back.
+    ok,reason=await record_callback_async(payload)
     if not ok:
         raise HTTPException(status_code=400,detail=reason)
     return {'received':True,'accepted':True,'signal_id':payload.get('signal_id'),'event_id':payload.get('event_id'),'status':reason}
