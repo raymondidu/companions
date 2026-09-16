@@ -10,6 +10,8 @@ and it is why this pause is asserted against the POST and not against that flag.
 """
 import asyncio
 import os
+import shutil
+import tempfile
 import unittest
 from datetime import datetime, timezone
 
@@ -40,10 +42,19 @@ def _reaches_the_post(market):
 def _deliver(market, **overrides):
     fx = _reaches_the_post(market)
     fx.update(overrides)
-    saved = {k: os.environ.get(k) for k in
-             ('COMPANION_EXECUTOR_BASE_URL', 'COMPANION_EXECUTOR_SECRET')}
+    # COMPANION_DATA_DIR is not optional here, and leaving it out is the second
+    # fixture bug this file has had. Without it the module writes its delivery
+    # state under /app/companion-data, which does not exist on a CI runner:
+    # the reversibility control got PermissionError '/app' there while passing
+    # locally, purely because the local shell runs as root. Every other routing
+    # test in this repo points it at a tmp dir for exactly this reason.
+    tmp = tempfile.mkdtemp(prefix='companion-pause-')
+    keys = ('COMPANION_EXECUTOR_BASE_URL', 'COMPANION_EXECUTOR_SECRET',
+            'COMPANION_DATA_DIR')
+    saved = {k: os.environ.get(k) for k in keys}
     os.environ['COMPANION_EXECUTOR_BASE_URL'] = 'https://executor.invalid'
     os.environ['COMPANION_EXECUTOR_SECRET'] = 'test-secret-name-only'
+    os.environ['COMPANION_DATA_DIR'] = tmp
     try:
         return asyncio.run(th.deliver_selected_signal(
             fx['market'], fx['profiles'],
@@ -56,6 +67,7 @@ def _deliver(market, **overrides):
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 class CompanionPauseIsInForce(unittest.TestCase):
@@ -104,6 +116,29 @@ class ThePauseIsReversible(unittest.TestCase):
 
     def tearDown(self):
         th.COMPANION_SCANNING_PAUSED = True
+
+    def test_the_fixture_never_writes_outside_a_temp_dir(self):
+        """Pins the fix for a CI-only failure this file actually caused.
+
+        Unset, COMPANION_DATA_DIR resolves to /app/companion-data, and the
+        control below walks far enough into the delivery path to create it.
+        That is fine as root, which is why it passed locally, and it is
+        PermissionError on a CI runner. Asserting the resolved path keeps the
+        difference visible instead of leaving it to whoever runs the suite.
+        """
+        tmp = tempfile.mkdtemp(prefix='companion-pause-probe-')
+        saved = os.environ.get('COMPANION_DATA_DIR')
+        try:
+            os.environ.pop('COMPANION_DATA_DIR', None)
+            self.assertEqual(str(th._data_dir()), '/app/companion-data')
+            os.environ['COMPANION_DATA_DIR'] = tmp
+            self.assertEqual(str(th._data_dir()), tmp)
+        finally:
+            if saved is None:
+                os.environ.pop('COMPANION_DATA_DIR', None)
+            else:
+                os.environ['COMPANION_DATA_DIR'] = saved
+            shutil.rmtree(tmp, ignore_errors=True)
 
     def test_clearing_it_lets_a_qualifying_signal_past_the_pause(self):
         th.COMPANION_SCANNING_PAUSED = False
