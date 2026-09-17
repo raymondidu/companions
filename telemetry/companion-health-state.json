@@ -1,16 +1,16 @@
 {
-  "captured_at_epoch": 1789639521.2852533,
+  "captured_at_epoch": 1789649166.6699655,
   "cleared_this_pass": [],
   "lifecycle": {
-    "accepted": 71,
+    "accepted": 73,
     "closed_positions": 27,
     "closed_signals": 20,
-    "generated": 91,
+    "generated": 93,
     "open_failed_positions": 842,
     "open_failed_signals": 46,
     "opened_positions": 51,
     "opened_signals": 33,
-    "sent": 89
+    "sent": 91
   },
   "open_failure_reasons": {
     "BELOW_MIN_CAPITAL": 57,
@@ -22,6 +22,6 @@
     "UNSPECIFIED_OPEN_FAILURE": 129
   },
   "open_faults": [],
-  "opening_stall_intervals": 1,
-  "scans": 750
+  "opening_stall_intervals": 2,
+  "scans": 894
 }
