@@ -1,16 +1,16 @@
 {
-  "captured_at_epoch": 1789861102.5066311,
+  "captured_at_epoch": 1789862729.705503,
   "cleared_this_pass": [],
   "lifecycle": {
     "accepted": 86,
     "closed_positions": 27,
     "closed_signals": 20,
-    "generated": 107,
+    "generated": 109,
     "open_failed_positions": 869,
     "open_failed_signals": 48,
     "opened_positions": 51,
     "opened_signals": 33,
-    "sent": 105
+    "sent": 107
   },
   "open_failure_reasons": {
     "BELOW_MIN_CAPITAL": 57,
@@ -25,11 +25,11 @@
     {
       "always_alarms": false,
       "code": "OPENING_STALLED",
-      "detail": "delivery advanced over 9 consecutive readings while opened_signals stayed at 33",
-      "open_for_seconds": 102494.5,
+      "detail": "delivery advanced over 10 consecutive readings while opened_signals stayed at 33",
+      "open_for_seconds": 104121.7,
       "since": 1789758608.012224
     }
   ],
-  "opening_stall_intervals": 9,
-  "scans": 4030
+  "opening_stall_intervals": 10,
+  "scans": 4055
 }
