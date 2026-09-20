@@ -1,5 +1,5 @@
 {
-  "captured_at_epoch": 1789897467.8498755,
+  "captured_at_epoch": 1789907294.9869816,
   "cleared_this_pass": [],
   "lifecycle": {
     "accepted": 86,
@@ -26,10 +26,10 @@
       "always_alarms": false,
       "code": "OPENING_STALLED",
       "detail": "delivery advanced over 11 consecutive readings while opened_signals stayed at 33",
-      "open_for_seconds": 138859.8,
+      "open_for_seconds": 148687.0,
       "since": 1789758608.012224
     }
   ],
   "opening_stall_intervals": 11,
-  "scans": 4582
+  "scans": 4731
 }
