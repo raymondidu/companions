@@ -343,6 +343,16 @@ jobs:
                 row = {k: delivery.get(k) for k in KEEP if k in delivery}
                 print('COMPANION_HANDSHAKE_DELIVERY %s %s'
                       % (key, json.dumps(row, sort_keys=True, default=str)))
+                # DROPPING A KEY SILENTLY IS HOW THE http_status GOT LOST IN THE
+                # FIRST PLACE. attempted_at and updated_at live on the ledger
+                # RECORD, not on the dict deliver_selected_signal returns, so
+                # /health cannot age this row -- say that out loud rather than
+                # printing a row that looks complete.
+                absent = [k for k in KEEP if k not in delivery]
+                if absent:
+                    print('COMPANION_HANDSHAKE_DELIVERY_ABSENT %s %s -- not carried '
+                          'by this payload, which is not the same as empty.'
+                          % (key, absent))
             PYHS
 
             # THE OTHER DIRECTION. Outbound auth and inbound callbacks are
