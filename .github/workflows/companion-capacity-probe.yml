@@ -263,8 +263,15 @@ jobs:
               echo "COMPANION_HANDSHAKE_INGEST_BODY_AUTH $(head -c 200 /tmp/ingest_auth.json 2>/dev/null | tr -d '\n')"
               if [ "$noauth" = "000" ] || [ "$withauth" = "000" ]; then
                 echo "COMPANION_HANDSHAKE_VERDICT UNREACHABLE the request did not complete, so this says nothing about the credential."
-              elif [ "$noauth" = "404" ] || [ "$withauth" = "404" ]; then
-                echo "COMPANION_HANDSHAKE_VERDICT ROUTE_ABSENT the ingest path answered 404. Our delivery target may have moved."
+              elif [ "$noauth" = "404" ] && [ "$withauth" = "404" ]; then
+                # MEASURED 2026-09-21 08:24: both calls returned 404 with an
+                # Express body, "Cannot GET /api/companion/ingest". Express
+                # answers an unmatched METHOD on an existing path with 404, not
+                # 405, so this is the method check replying before auth -- the
+                # same INCONCLUSIVE case as a 405, and NOT a missing route. The
+                # first version of this file called it ROUTE_ABSENT and would
+                # have sent us hunting for a moved endpoint that had not moved.
+                echo "COMPANION_HANDSHAKE_VERDICT INCONCLUSIVE both GETs answered 404 (Express returns 404 for a wrong method, not 405), so the method check replied before auth. The route is reachable; the credential was not tested. Read COMPANION_HANDSHAKE_DELIVERY below -- a real POST's http_status is the only thing that settles it."
               elif [ "$noauth" = "401" ] && [ "$withauth" = "401" ]; then
                 echo "COMPANION_HANDSHAKE_VERDICT CREDENTIAL_REJECTED our secret is refused on the route we DELIVER to, not only on capacity. Signals posted with it would be refused the same way."
               elif [ "$noauth" = "401" ]; then
@@ -295,14 +302,38 @@ jobs:
                 raise SystemExit(0)
 
             th = health.get('tradehouse') or {}
-            rejects = th.get('callback_rejections')
-            print('COMPANION_HANDSHAKE_CALLBACK_REJECTS %s -- inbound, counted since '
-                  'this process started. An empty map is not proof of a healthy '
-                  'inbound link, only that nothing was turned away.'
-                  % (rejects if rejects else 'NONE_SINCE_PROCESS_START'))
+            # THIS FIELD IS NOT WHAT ITS NAME SAYS. verify_callback_signature
+            # increments _CALLBACK_REJECTS['ACCEPTED'] on the PASS branch, so the
+            # map the payload calls 'callback_rejections' counts every verified
+            # callback too. The first run of this probe printed
+            # {'ACCEPTED': 5256} under a REJECTS heading, which reads as 5,256
+            # failures and is the exact opposite of the truth: 5,256 callbacks
+            # verified and none turned away. Split, and say which is which.
+            raw = th.get('callback_rejections')
+            if raw is None:
+                print('COMPANION_HANDSHAKE_INBOUND_VERIFIED FIELD_ABSENT -- /health '
+                      'carried no callback_rejections at all. That is our payload '
+                      'shape changing, not a statement about the inbound link, and '
+                      'it must not read as zero.')
+                raw = {}
+            elif not isinstance(raw, dict):
+                print('COMPANION_HANDSHAKE_INBOUND_VERIFIED WRONG_TYPE %s -- present '
+                      'and not a map, so nothing below is a measurement.'
+                      % type(raw).__name__)
+                raw = {}
+            counts = raw
+            accepted = counts.get('ACCEPTED', 0)
+            refused = {k: v for k, v in counts.items() if k != 'ACCEPTED'}
+            print('COMPANION_HANDSHAKE_INBOUND_VERIFIED accepted=%s refused=%s -- '
+                  'counted since this process started. Inbound is TradeHouse '
+                  'signing with the CALLBACK secret; it is a different credential '
+                  'on a different route from the outbound one below, and either '
+                  'can be dead while the other works.'
+                  % (accepted, refused if refused else 'NONE'))
 
             KEEP = ('sent', 'status', 'http_status', 'accepted', 'lifecycle_state',
-                    'reason', 'reason_code', 'signal_id', 'path')
+                    'reason', 'reason_code', 'signal_id', 'path',
+                    'attempted_at', 'updated_at')
             for key, market in sorted((health.get('markets') or {}).items()):
                 delivery = market.get('tradehouse_delivery')
                 if not isinstance(delivery, dict):
