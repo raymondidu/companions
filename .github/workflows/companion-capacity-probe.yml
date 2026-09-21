@@ -1,5 +1,13 @@
-name: Companion Capacity Probe
+name: Companion TradeHouse Handshake
 
+# READ-AND-LOG ONLY. Two things live here: the capacity read this file started
+# as, and the credential handshake added under it on 2026-09-21 after that read
+# came back 401 against a 200 five days earlier. Neither sends a trade, neither
+# POSTs anything at all, and nothing in the delivery path consults either.
+#
+# The file name still says capacity because renaming it would orphan the run
+# history of the thing that found the 401.
+#
 # READ-AND-LOG ONLY. This is the ENTIRE v1 of the capacity signal on our side.
 #
 # THE OWNER'S CONDITION, VERBATIM: "a yes here is zero-risk as long as it stays
@@ -46,7 +54,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 6
     steps:
-      - name: Read the executor's capacity signal, and act on nothing
+      - name: Handshake with the executor, and act on nothing
         uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ secrets.DO_HOST }}
@@ -204,3 +212,118 @@ jobs:
                       'indistinguishable from here.')
             PYCAP
             echo "COMPANION_CAPACITY_COMPLETE"
+            # ============ HANDSHAKE, ADDED 2026-09-21 ============
+            # THE CAPACITY READ ABOVE RETURNED 401 ON 2026-09-21 08:18 UTC,
+            # against a 200 carrying real per-instrument numbers on 2026-09-16
+            # 20:02. That is the whole reason this block exists. A 401 on ONE
+            # endpoint cannot tell you whether the outbound credential is dead
+            # everywhere or whether that one route tightened its own auth, and
+            # those two need opposite fixes: a redeploy versus a conversation
+            # with the executor.
+            #
+            # NOTHING BELOW POSTS ANYTHING. TRADEHOUSE_EXECUTION_HANDOFF.md
+            # section 4 is explicit -- "Companion must not manufacture a
+            # synthetic signal merely to test transport" -- so the ingest route
+            # is probed with a GET, which cannot open a trade whatever the
+            # credential does.
+            #
+            # A GET is answered either by the auth layer or by the method check,
+            # and WHICH ONE answers is the discriminator:
+            #
+            #   no-secret 401, with-secret anything else -> auth runs first and
+            #     our secret PASSES on ingest. The capacity 401 is that route's
+            #     own problem, not a dead credential.
+            #   both 401 -> auth runs first and our secret FAILS. The whole
+            #     outbound path is shut, not just capacity.
+            #   both the same non-401 -> the method check answers before auth.
+            #     Proves the route is reachable and NOTHING about the secret.
+            #
+            # The fingerprint is printed so a later run can say whether a
+            # redeploy actually changed the secret. It is a truncated one-way
+            # hash, not a value, and cannot be reversed into one -- the same
+            # rule the callback auth probe already runs under.
+            secret="$(awk -F= '$1=="COMPANION_EXECUTOR_SECRET"{sub(/^[^=]*=/,"");print;exit}' .env)"
+            base="$(awk -F= '$1=="COMPANION_EXECUTOR_BASE_URL"{sub(/^[^=]*=/,"");print;exit}' .env)"
+            base="${base:-https://tradehouse.app}"
+            if [ -z "$secret" ]; then
+              echo "COMPANION_HANDSHAKE_VERDICT UNREADABLE no outbound secret on this box"
+            else
+              fp="$(printf '%s' "$secret" | sha256sum | cut -c1-8)"
+              echo "COMPANION_HANDSHAKE_SECRET name=COMPANION_EXECUTOR_SECRET length=${#secret} sha256_8=${fp} -- the deploy mints this over OIDC from /api/companion/bootstrap, so it changes when the box is redeployed and only then."
+              noauth=$(curl -sS -o /tmp/ingest_noauth.json -w '%{http_code}' \
+                --connect-timeout 10 --max-time 20 -X GET \
+                "${base}/api/companion/ingest" || echo 000)
+              withauth=$(curl -sS -o /tmp/ingest_auth.json -w '%{http_code}' \
+                --connect-timeout 10 --max-time 20 -X GET \
+                -H "x-executor-secret: ${secret}" \
+                "${base}/api/companion/ingest" || echo 000)
+              unset secret
+              echo "COMPANION_HANDSHAKE_INGEST_GET url=${base}/api/companion/ingest no_secret=${noauth} with_secret=${withauth}"
+              echo "COMPANION_HANDSHAKE_INGEST_BODY_NOAUTH $(head -c 200 /tmp/ingest_noauth.json 2>/dev/null | tr -d '\n')"
+              echo "COMPANION_HANDSHAKE_INGEST_BODY_AUTH $(head -c 200 /tmp/ingest_auth.json 2>/dev/null | tr -d '\n')"
+              if [ "$noauth" = "000" ] || [ "$withauth" = "000" ]; then
+                echo "COMPANION_HANDSHAKE_VERDICT UNREACHABLE the request did not complete, so this says nothing about the credential."
+              elif [ "$noauth" = "404" ] || [ "$withauth" = "404" ]; then
+                echo "COMPANION_HANDSHAKE_VERDICT ROUTE_ABSENT the ingest path answered 404. Our delivery target may have moved."
+              elif [ "$noauth" = "401" ] && [ "$withauth" = "401" ]; then
+                echo "COMPANION_HANDSHAKE_VERDICT CREDENTIAL_REJECTED our secret is refused on the route we DELIVER to, not only on capacity. Signals posted with it would be refused the same way."
+              elif [ "$noauth" = "401" ]; then
+                echo "COMPANION_HANDSHAKE_VERDICT CREDENTIAL_ACCEPTED_ON_INGEST auth runs before the method check and our secret cleared it. The capacity 401 belongs to that route, not to the delivery path."
+              elif [ "$noauth" = "$withauth" ]; then
+                echo "COMPANION_HANDSHAKE_VERDICT INCONCLUSIVE the method check answered before auth, so both calls look alike. Reachability proven, credential not tested."
+              else
+                echo "COMPANION_HANDSHAKE_VERDICT UNEXPECTED ${noauth}/${withauth} -- read the bodies above rather than fitting them to a case."
+              fi
+            fi
+
+            # WHAT THE LAST REAL DELIVERY GOT BACK. /health already carries this
+            # per market and the telemetry workflow prints only `status or
+            # lifecycle_state`, which is None for a successful POST -- so the one
+            # case that matters has been displaying as None, indistinguishable
+            # from "no idea". http_status is the number that settles it.
+            curl --connect-timeout 5 --max-time 25 -fsS \
+              http://127.0.0.1:8082/health -o /tmp/handshake_health.json \
+              || echo "COMPANION_HANDSHAKE_HEALTH_UNREADABLE the dashboard did not answer /health in 25s. That is our instrument failing and says nothing about the executor."
+
+            python3 - <<'PYHS' || echo "COMPANION_HANDSHAKE_LEDGER UNREADABLE probe parse failed"
+            import json
+
+            try:
+                health = json.load(open('/tmp/handshake_health.json'))
+            except Exception as exc:
+                print('COMPANION_HANDSHAKE_LEDGER UNREADABLE %s' % type(exc).__name__)
+                raise SystemExit(0)
+
+            th = health.get('tradehouse') or {}
+            rejects = th.get('callback_rejections')
+            print('COMPANION_HANDSHAKE_CALLBACK_REJECTS %s -- inbound, counted since '
+                  'this process started. An empty map is not proof of a healthy '
+                  'inbound link, only that nothing was turned away.'
+                  % (rejects if rejects else 'NONE_SINCE_PROCESS_START'))
+
+            KEEP = ('sent', 'status', 'http_status', 'accepted', 'lifecycle_state',
+                    'reason', 'reason_code', 'signal_id', 'path')
+            for key, market in sorted((health.get('markets') or {}).items()):
+                delivery = market.get('tradehouse_delivery')
+                if not isinstance(delivery, dict):
+                    print('COMPANION_HANDSHAKE_DELIVERY %s NONE_RECORDED -- this market '
+                          'has attempted no delivery since the process started.' % key)
+                    continue
+                row = {k: delivery.get(k) for k in KEEP if k in delivery}
+                print('COMPANION_HANDSHAKE_DELIVERY %s %s'
+                      % (key, json.dumps(row, sort_keys=True, default=str)))
+            PYHS
+
+            # THE OTHER DIRECTION. Outbound auth and inbound callbacks are
+            # separate credentials and separate routes; one can be dead while the
+            # other works, and reporting either as "the connection" hides that.
+            cid=$(docker compose ps -q companion-dashboard 2>/dev/null || true)
+            if [ -z "$cid" ]; then
+              echo "COMPANION_HANDSHAKE_INBOUND CONTAINER_UNRESOLVED means nothing about the link"
+            else
+              lines=$(docker logs --since 6h "$cid" 2>&1 | grep -c "companion/callback" || true)
+              echo "COMPANION_HANDSHAKE_INBOUND_6H callback_log_lines=${lines:-0}"
+              docker logs --since 6h "$cid" 2>&1 | grep "companion/callback" | tail -3 \
+                | sed 's/^/COMPANION_HANDSHAKE_INBOUND_TAIL /' || true
+            fi
+            echo "COMPANION_HANDSHAKE_COMPLETE"
