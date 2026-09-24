@@ -119,6 +119,81 @@ def _write(path: Path, value: dict) -> None:
     tmp.replace(path)
 
 
+def ledger_footprint(callbacks: dict | None = None) -> dict[str, Any]:
+    """How big the two ledgers are, and what is making them big.
+
+    THE COMPANION DASHBOARD IS GROWING WITHOUT BOUND AND NOTHING SAID SO.
+    Measured on the production box, same container, two readings:
+
+        2026-09-21 08:27    258 MB RSS     5,256 callbacks verified
+        2026-09-24 10:31  1,151 MB RSS    50,385 callbacks verified
+
+    That is ~20 KB of resident memory per callback and it is monotonic. On
+    2026-09-24 at 06:53 the kernel OOM-killed a uvicorn process on that host,
+    with host memory reading 61.5% and swap at zero -- so no percentage
+    threshold saw it coming and none ever will.
+
+    The mechanism is not subtle once the numbers are in front of you: every
+    callback does _read of the whole ledger, mutates it, and _write dumps the
+    whole thing back. record_callback already carries a comment calling it a
+    "34.5 MB ledger". At the rate above that is tens of gigabytes of JSON
+    parsing an hour, which is also the 98.7% of a core this container holds.
+
+    What is NOT decided here: nothing is pruned, and nothing should be until
+    this says which part is the bulk. Two candidates, and they are not
+    equivalent -- event_ids is bookkeeping, while positions[*].events holds the
+    OPEN_FAILED payloads that TRADEHOUSE_EXECUTION_HANDOFF section 6 says to
+    preserve so the dashboard can show the broker failure reason. Deleting the
+    first is housekeeping; deleting the second is destroying execution evidence
+    and is the owner's call, not a tidy-up.
+
+    Counts, not serialisation. Measuring the byte share of a subtree means
+    re-serialising it, which is the exact cost this exists to report on. File
+    size is free from the filesystem and the counts divide into it.
+    """
+    out: dict[str, Any] = {}
+    for label, path in (("delivery", _state_path()), ("callbacks", _callback_path())):
+        try:
+            out[label + "_bytes"] = path.stat().st_size if path.exists() else 0
+        except Exception:
+            out[label + "_bytes"] = None
+
+    # PASSED IN, NOT RE-READ. delivery_snapshot has already parsed this file,
+    # and parsing it a second time to report how expensive parsing it is would
+    # have doubled the cost of the exact thing being measured. Only a standalone
+    # caller pays for its own read.
+    if callbacks is None:
+        callbacks = _read(_callback_path())
+    callbacks = callbacks if isinstance(callbacks, dict) else {}
+    signals = callbacks.get("signals") or {}
+    event_ids = callbacks.get("event_ids") or {}
+    positions = 0
+    events = 0
+    for signal in signals.values():
+        if not isinstance(signal, dict):
+            continue
+        rows = signal.get("positions") or {}
+        positions += len(rows)
+        for row in rows.values():
+            if isinstance(row, dict):
+                events += len(row.get("events") or {})
+    out.update({
+        "callback_signals": len(signals),
+        "callback_positions": positions,
+        "stored_event_payloads": events,
+        "dedupe_event_ids": len(event_ids),
+    })
+    total = out.get("callbacks_bytes")
+    if isinstance(total, int) and events:
+        out["bytes_per_stored_event"] = round(total / float(events), 1)
+    # The growth is per EVENT, so the two counts that can be pruned are named
+    # explicitly rather than left for a reader to derive from a total.
+    out["note"] = ("dedupe_event_ids is bookkeeping; stored_event_payloads is the "
+                   "execution evidence the handoff contract says to preserve. They "
+                   "grow together and only one of them is safe to drop.")
+    return out
+
+
 def _callback_position_rows(callbacks: dict):
     for signal_id, signal in (callbacks.get("signals", {}) or {}).items():
         positions = signal.get("positions", {}) if isinstance(signal, dict) else {}
@@ -246,6 +321,10 @@ def delivery_snapshot(ledger: str = 'full') -> dict:
         "policy_version": POLICY_VERSION,
         "cohort": COHORT,
         "active_paths": ACTIVE_PATHS,
+        # Small, and kept OUT of the ledger trimming below on purpose: this is
+        # exactly the number a reader needs when /health is slow or the box is
+        # short of memory, which is when the ledger itself is omitted.
+        "ledger_footprint": ledger_footprint(callbacks),
         "executor_configured": bool(_executor_base_url() and _executor_secret()),
         "callback_configured": bool(_callback_secret()),
         # WHY callbacks were turned away, since this process started. A bare

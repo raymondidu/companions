@@ -331,6 +331,21 @@ jobs:
                   'can be dead while the other works.'
                   % (accepted, refused if refused else 'NONE'))
 
+            # HOW BIG THE THING THAT IS GROWING IS. The dashboard went 258MB to
+            # 1,151MB in three days while verified callbacks went 5,256 to
+            # 50,385, and the kernel OOM-killed a uvicorn on that host at
+            # 06:53 with host memory reading 61.5%. No percentage threshold
+            # saw it and none will; this is the number that would have.
+            foot = th.get('ledger_footprint')
+            if not isinstance(foot, dict):
+                print('COMPANION_HANDSHAKE_LEDGER_SIZE ABSENT_ON_THIS_BUILD -- the '
+                      'dashboard predates the footprint, so the growth is still '
+                      'unmeasured here. That is not a reading of zero.')
+            else:
+                print('COMPANION_HANDSHAKE_LEDGER_SIZE %s'
+                      % json.dumps({k: v for k, v in foot.items() if k != 'note'},
+                                   sort_keys=True, default=str))
+
             KEEP = ('sent', 'status', 'http_status', 'accepted', 'lifecycle_state',
                     'reason', 'reason_code', 'signal_id', 'path',
                     'attempted_at', 'updated_at')
