@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import atexit
+import copy
 import hashlib
 import hmac
 import json
 import os
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -119,6 +122,214 @@ def _write(path: Path, value: dict) -> None:
     tmp.replace(path)
 
 
+# ============ THE CALLBACK LEDGER IS PARSED ONCE, NOT ONCE PER CALLBACK ============
+#
+# record_callback did `state = _read(_callback_path())` at the top and
+# `_write(_callback_path(), state)` at the bottom, and delivery_snapshot did its
+# own `_read` of the same file. That file is 40,009,220 bytes across 29,312
+# stored event payloads. So every inbound callback AND every /health parsed 40 MB
+# of JSON into a fresh Python object graph and threw it away.
+#
+# Measured on the production box, same container:
+#
+#     2026-09-21 08:27    258 MB RSS     5,256 callbacks verified
+#     2026-09-24 10:31  1,151 MB RSS    50,385 callbacks verified
+#
+# ~20 KB of resident memory per callback, monotonic, and on 2026-09-24 at
+# 06:53 the kernel OOM-killed a uvicorn process on that host while host memory
+# read 61.5% and swap was zero. No percentage threshold saw it and none will.
+# The container also held 98.7% of a core doing nothing but this.
+#
+# NOTHING IS DELETED TO FIX IT. The size of the data was never the fault; the
+# fault was re-parsing all of it, several times a minute, forever. One parsed
+# copy is held and mutated in place, so after startup the ledger is parsed
+# ZERO more times. TRADEHOUSE_EXECUTION_HANDOFF.md section 6 says the
+# OPEN_FAILED payloads must be preserved, and every one of them still is.
+#
+# THE SNAPSHOT WRITE IS DEBOUNCED, AND A WAL IS WHAT MAKES THAT SAFE.
+# Rewriting 40 MB per callback is 27 GB an hour of disk at the observed rate.
+# Instead each accepted event is appended to a write-ahead log the instant it is
+# accepted -- one short line, O(1) -- and the full snapshot is written at most
+# every _LEDGER_FLUSH_SECONDS or every _LEDGER_FLUSH_EVENTS, whichever comes
+# first. On load the WAL is replayed over the snapshot, so a crash between
+# flushes loses NOTHING. record_callback already dedupes on event_id, which is
+# what makes replay idempotent.
+#
+# ONE COPY SHARED BETWEEN TWO THREADS NEEDS A LOCK, and that is a hazard this
+# change introduces rather than one it inherits. record_callback runs in a
+# worker thread via asyncio.to_thread; /health is a plain `def` so FastAPI runs
+# it in a different worker thread. Iterating the ledger in one while the other
+# mutates it raises "dictionary changed size during iteration". Every access
+# goes through _LEDGER_LOCK. The reader's work under it is the snapshot build,
+# which is the same walk it always did, minus the 40 MB parse.
+_LEDGER_FLUSH_SECONDS = 20.0
+_LEDGER_FLUSH_EVENTS = 50
+
+_LEDGER_LOCK = threading.RLock()
+_LEDGER: dict[str, Any] = {
+    "state": None,        # the parsed ledger, or None before first load
+    "fingerprint": None,  # (mtime_ns, size) of the snapshot we last wrote or read
+    "dirty": 0,           # events accepted since the last successful flush
+    "flushed_at": 0.0,
+    "wal_lines": 0,
+    "load_error": None,
+}
+
+
+def _wal_path() -> Path:
+    return _data_dir() / "tradehouse_callbacks.wal"
+
+
+def _fingerprint(path: Path):
+    try:
+        st = path.stat()
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
+def _replay_wal(state: dict) -> int:
+    """Fold any events the last snapshot did not include back into the ledger.
+
+    A truncated or corrupt final line is SKIPPED, not fatal. A WAL is written
+    without fsync on purpose -- paying for durability per event on this path is
+    what we are escaping -- so a torn tail is an expected shape, and refusing to
+    start because of one would turn a saved event into an outage.
+    """
+    path = _wal_path()
+    if not path.exists():
+        return 0
+    replayed = 0
+    seen = state.setdefault("event_ids", {})
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(row, dict):
+                continue
+            event_id = str(row.get("event_id") or "").strip()
+            if not event_id or event_id in seen:
+                continue
+            _apply_callback(state, row)
+            replayed += 1
+    except OSError:
+        return replayed
+    return replayed
+
+
+def _load_ledger() -> dict:
+    """The ledger, parsed once. The caller MUST hold _LEDGER_LOCK.
+
+    THE COMMENT SAYING SO WAS NOT ENOUGH, AND CI PROVED IT. delivery_snapshot
+    held the lock across the ASSIGNMENT and then walked the shared ledger
+    outside it, while the docstring claimed "the lock is held for the whole
+    build". The reader raised "dictionary changed size during iteration" on the
+    runner and not on my machine, because a race is timing and timing differs.
+
+    So the requirement is enforced where it is used rather than described where
+    it is defined. Anything that reaches the shared ledger without the lock
+    fails immediately, deterministically, in every test, instead of once in a
+    while in production.
+    """
+    if not _LEDGER_LOCK._is_owned():
+        raise RuntimeError(
+            "_load_ledger called without _LEDGER_LOCK: the ledger is one shared "
+            "object across two worker threads and walking it unlocked raises "
+            "'dictionary changed size during iteration' under load")
+    path = _callback_path()
+    current = _fingerprint(path)
+    if _LEDGER["state"] is not None and _LEDGER["fingerprint"] == current:
+        return _LEDGER["state"]
+
+    # A fingerprint that does not match what we last saw means something outside
+    # this process touched the file. We are the only writer, so that should not
+    # happen -- but serving a stale ledger because of an assumption is how a
+    # cache becomes the outage. Re-read, and say so.
+    state = _read(path)
+    if not isinstance(state, dict):
+        state = {}
+    replayed = _replay_wal(state)
+    _LEDGER["state"] = state
+    _LEDGER["fingerprint"] = current
+    _LEDGER["dirty"] = replayed
+    _LEDGER["wal_lines"] = replayed
+    _LEDGER["load_error"] = None
+    # THE DEBOUNCE WINDOW STARTS HERE, NOT AT ZERO. flushed_at left at 0.0
+    # against a large time.monotonic() made `now - flushed_at >= 20.0` true on
+    # the very first callback after every process start, so the first one always
+    # rewrote the whole snapshot. Its own test caught it: there was never an
+    # unflushed event to crash-test.
+    _LEDGER["flushed_at"] = time.monotonic()
+    if replayed:
+        # Everything the WAL held is now in memory; persist it and start clean.
+        _flush_ledger(force=True)
+    return state
+
+
+def _flush_ledger(force: bool = False) -> bool:
+    """Write the snapshot if it is time. Callers must hold _LEDGER_LOCK.
+
+    Returns True when a write happened. A failed write leaves the WAL intact,
+    so the events are still recoverable and the next flush tries again.
+    """
+    state = _LEDGER["state"]
+    if state is None or not _LEDGER["dirty"]:
+        return False
+    now = time.monotonic()
+    if not force:
+        due = (now - float(_LEDGER["flushed_at"] or 0.0)) >= _LEDGER_FLUSH_SECONDS
+        if not due and int(_LEDGER["dirty"]) < _LEDGER_FLUSH_EVENTS:
+            return False
+    try:
+        _write(_callback_path(), state)
+    except Exception:
+        return False
+    _LEDGER["fingerprint"] = _fingerprint(_callback_path())
+    _LEDGER["dirty"] = 0
+    _LEDGER["flushed_at"] = now
+    try:
+        _wal_path().unlink()
+    except OSError:
+        pass
+    _LEDGER["wal_lines"] = 0
+    return True
+
+
+def _append_wal(payload: dict) -> None:
+    """Durability for the gap between snapshots. Callers must hold _LEDGER_LOCK."""
+    try:
+        path = _wal_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, sort_keys=True, default=str) + "\n")
+        _LEDGER["wal_lines"] = int(_LEDGER["wal_lines"] or 0) + 1
+    except Exception:
+        # A WAL that cannot be written must not refuse the callback. The event is
+        # still in memory and still reaches the next snapshot; what is lost is
+        # only the crash-window guarantee, and losing the event outright would be
+        # strictly worse.
+        pass
+
+
+def _flush_ledger_on_exit() -> None:
+    with _LEDGER_LOCK:
+        _flush_ledger(force=True)
+
+
+atexit.register(_flush_ledger_on_exit)
+
+
+def ledger_state() -> dict:
+    """The live ledger. Callers MUST hold _LEDGER_LOCK while reading it."""
+    with _LEDGER_LOCK:
+        return _load_ledger()
+
+
 def ledger_footprint(callbacks: dict | None = None) -> dict[str, Any]:
     """How big the two ledgers are, and what is making them big.
 
@@ -163,7 +374,20 @@ def ledger_footprint(callbacks: dict | None = None) -> dict[str, Any]:
     # have doubled the cost of the exact thing being measured. Only a standalone
     # caller pays for its own read.
     if callbacks is None:
-        callbacks = _read(_callback_path())
+        # The cached ledger, not a fresh 40 MB parse. A standalone caller that
+        # re-read the file to report how expensive reading the file is would be
+        # the same fault this function exists to expose.
+        #
+        # The lock covers the WALK, not just this call. Wrapping only the read
+        # and then iterating outside it is the exact bug CI caught in
+        # delivery_snapshot. _LEDGER_LOCK is an RLock, so a caller that already
+        # holds it (delivery_snapshot does) re-enters harmlessly.
+        with _LEDGER_LOCK:
+            return _footprint_of(_load_ledger(), out)
+    return _footprint_of(callbacks, out)
+
+
+def _footprint_of(callbacks, out: dict[str, Any]) -> dict[str, Any]:
     callbacks = callbacks if isinstance(callbacks, dict) else {}
     signals = callbacks.get("signals") or {}
     event_ids = callbacks.get("event_ids") or {}
@@ -186,6 +410,19 @@ def ledger_footprint(callbacks: dict | None = None) -> dict[str, Any]:
     total = out.get("callbacks_bytes")
     if isinstance(total, int) and events:
         out["bytes_per_stored_event"] = round(total / float(events), 1)
+
+    # The snapshot on disk is no longer the whole story: events accepted since
+    # the last flush live in the WAL and in memory. A footprint that reported
+    # only the snapshot would under-report by exactly the events most at risk.
+    with _LEDGER_LOCK:
+        out["unflushed_events"] = int(_LEDGER["dirty"] or 0)
+        out["wal_lines"] = int(_LEDGER["wal_lines"] or 0)
+        out["ledger_parsed_in_memory"] = _LEDGER["state"] is not None
+    try:
+        wal = _wal_path()
+        out["wal_bytes"] = wal.stat().st_size if wal.exists() else 0
+    except OSError:
+        out["wal_bytes"] = None
     # The growth is per EVENT, so the two counts that can be pruned are named
     # explicitly rather than left for a reader to derive from a total.
     out["note"] = ("dedupe_event_ids is bookkeeping; stored_event_payloads is the "
@@ -206,6 +443,19 @@ def _callback_position_rows(callbacks: dict):
 
 
 def delivery_snapshot(ledger: str = 'full') -> dict:
+    """The execution-truth snapshot, built with the ledger held still.
+
+    THE LOCK COVERS THE WHOLE BUILD, not just the read. It used to wrap only
+    `callbacks = _load_ledger()`, so every walk below ran while record_callback
+    was free to insert into the same dicts from another worker thread. CI caught
+    it as "dictionary changed size during iteration" on a run that was green on
+    my machine twenty minutes earlier.
+    """
+    with _LEDGER_LOCK:
+        return _delivery_snapshot_locked(ledger)
+
+
+def _delivery_snapshot_locked(ledger: str = 'full') -> dict:
     """The execution-truth snapshot. `ledger` decides how much of it travels.
 
     THREE MODES, because the three callers need genuinely different amounts:
@@ -244,7 +494,16 @@ def delivery_snapshot(ledger: str = 'full') -> dict:
     # only visible symptom is 401s in an access log, which cannot separate a
     # secret mismatch from a stale replay.
     callback_rejects = callback_rejection_counts()
-    callbacks = _read(_callback_path())
+    # PARSED ONCE, NOT ONCE PER REQUEST. This ran on every /health, every
+    # /api/markets and every /api/companion/tradehouse, and each one paid a
+    # fresh 40 MB parse for a file only this process writes.
+    #
+    # The lock is held for the whole build because record_callback mutates this
+    # same object from another worker thread, and iterating it while it changes
+    # raises "dictionary changed size during iteration". That hazard is
+    # introduced by sharing one copy and is the price of not parsing; the work
+    # under the lock is the same walk this function always did, minus the parse.
+    callbacks = _load_ledger()
     signals = state.get("signals", {})
     callback_signals = callbacks.get("signals", {})
     rows = list(_callback_position_rows(callbacks))
@@ -341,7 +600,10 @@ def delivery_snapshot(ledger: str = 'full') -> dict:
         "unspecified_open_failure_event_count_max": max(unspecified_event_counts, default=0),
         "unspecified_open_failure_rows_with_events": sum(1 for n in unspecified_event_counts if n > 0),
         "signals": signals,
-        "callbacks": callback_signals,
+        # A live reference into the shared ledger, serialised by FastAPI after
+        # the lock is gone. 'full' is the detail read and is rarely called, so
+        # it pays for a private copy rather than racing the writer.
+        "callbacks": copy.deepcopy(callback_signals) if callback_signals else callback_signals,
     }
     if ledger == "none":
         out.pop("signals", None)
@@ -366,8 +628,13 @@ def delivery_snapshot(ledger: str = 'full') -> dict:
                 newest[market] = (sid, stamp)
         keep = {sid for sid, _ in newest.values()}
         out["signals"] = {k: v for k, v in (signals or {}).items() if k in keep}
-        out["callbacks"] = {k: v for k, v in (callback_signals or {}).items()
-                            if k in keep}
+        # COPIED, NOT REFERENCED. callback_signals points into the shared ledger,
+        # and FastAPI serialises this payload long after the lock is released --
+        # so handing out a live reference races exactly the way the unlocked walk
+        # did. `signals` above comes from the delivery file, which _read already
+        # returns as a private parse, so only this side needs it.
+        out["callbacks"] = copy.deepcopy(
+            {k: v for k, v in (callback_signals or {}).items() if k in keep})
         out["ledger_omitted"] = {
             "reason": "the dashboard only reads the newest signal per market and "
                       "its callback; the full ledger made this a 28MB body and the "
@@ -621,11 +888,42 @@ def record_callback(payload: dict) -> tuple[bool, str]:
     if event_type == "OPENED" and not payload.get("broker_position_id"):
         return False, "OPENED_MISSING_BROKER_POSITION_ID"
 
-    state = _read(_callback_path())
-    seen = state.setdefault("event_ids", {})
-    if event_id in seen:
-        return True, "DUPLICATE_EVENT"
+    # THE LEDGER IS PARSED ONCE, NOT ONCE PER CALLBACK. See _load_ledger. The
+    # lock is held across the whole mutation because /health reads this same
+    # object from a different worker thread.
+    with _LEDGER_LOCK:
+        state = _load_ledger()
+        seen = state.setdefault("event_ids", {})
+        if event_id in seen:
+            return True, "DUPLICATE_EVENT"
+        ok, reason = _record_into(state, payload, signal_id, event_id,
+                                  tradehouse_id, event_type, sequence)
+        if not ok:
+            return ok, reason
+        # Durable NOW, cheaply; the 40 MB snapshot follows on a debounce.
+        # Ordering matters: the WAL line goes down before the event counts as
+        # flushable, so a crash between the two costs a replayable line and
+        # never a lost event.
+        #
+        # This lives HERE and not in _record_into on purpose. _record_into is
+        # also the replay path, and a replay that appended to the WAL it was
+        # reading would rewrite its own input on every restart.
+        _append_wal(payload)
+        _LEDGER["dirty"] = int(_LEDGER["dirty"] or 0) + 1
+        _flush_ledger()
+        return True, "RECORDED"
 
+
+def _record_into(state, payload, signal_id, event_id, tradehouse_id,
+                 event_type, sequence) -> tuple[bool, str]:
+    """Fold one validated, non-duplicate callback into the ledger.
+
+    Split out of record_callback so the WAL replay path applies an event through
+    EXACTLY the same code that accepted it. A replay that reconstructed the row
+    its own way would drift from the live path silently, and the drift would only
+    show up after a crash -- the worst possible time to discover it.
+    """
+    seen = state.setdefault("event_ids", {})
     signals = state.setdefault("signals", {})
     sig = signals.setdefault(signal_id, {"positions": {}, "updated_at": _utcnow()})
     positions = sig.setdefault("positions", {})
@@ -675,8 +973,27 @@ def record_callback(payload: dict) -> tuple[bool, str]:
 
     positions[tradehouse_id] = pos
     signals[signal_id] = sig
-    _write(_callback_path(), state)
     return True, "RECORDED"
+
+
+def _apply_callback(state: dict, payload: dict) -> None:
+    """WAL replay. Re-validates, because a WAL line is a file on disk and a file
+    on disk is not a promise: a torn or hand-edited line must not enter the
+    ledger just because it parsed as JSON."""
+    signal_id = str(payload.get("signal_id") or "").strip()
+    event_id = str(payload.get("event_id") or "").strip()
+    tradehouse_id = str(payload.get("tradehouse_id") or "").strip()
+    event_type = str(payload.get("event_type") or payload.get("event") or "").strip().upper()
+    if not (signal_id and event_id and tradehouse_id):
+        return
+    if event_type not in CALLBACK_EVENTS:
+        return
+    try:
+        sequence = int(payload.get("event_sequence"))
+    except Exception:
+        return
+    _record_into(state, payload, signal_id, event_id, tradehouse_id,
+                 event_type, sequence)
 
 
 # THE CALLBACK LEDGER IS 34.5 MB AND record_callback REWRITES ALL OF IT.
