@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import copy
 import hashlib
 import hmac
 import json
@@ -222,7 +223,24 @@ def _replay_wal(state: dict) -> int:
 
 
 def _load_ledger() -> dict:
-    """The ledger, parsed once. Callers must hold _LEDGER_LOCK."""
+    """The ledger, parsed once. The caller MUST hold _LEDGER_LOCK.
+
+    THE COMMENT SAYING SO WAS NOT ENOUGH, AND CI PROVED IT. delivery_snapshot
+    held the lock across the ASSIGNMENT and then walked the shared ledger
+    outside it, while the docstring claimed "the lock is held for the whole
+    build". The reader raised "dictionary changed size during iteration" on the
+    runner and not on my machine, because a race is timing and timing differs.
+
+    So the requirement is enforced where it is used rather than described where
+    it is defined. Anything that reaches the shared ledger without the lock
+    fails immediately, deterministically, in every test, instead of once in a
+    while in production.
+    """
+    if not _LEDGER_LOCK._is_owned():
+        raise RuntimeError(
+            "_load_ledger called without _LEDGER_LOCK: the ledger is one shared "
+            "object across two worker threads and walking it unlocked raises "
+            "'dictionary changed size during iteration' under load")
     path = _callback_path()
     current = _fingerprint(path)
     if _LEDGER["state"] is not None and _LEDGER["fingerprint"] == current:
@@ -359,8 +377,17 @@ def ledger_footprint(callbacks: dict | None = None) -> dict[str, Any]:
         # The cached ledger, not a fresh 40 MB parse. A standalone caller that
         # re-read the file to report how expensive reading the file is would be
         # the same fault this function exists to expose.
+        #
+        # The lock covers the WALK, not just this call. Wrapping only the read
+        # and then iterating outside it is the exact bug CI caught in
+        # delivery_snapshot. _LEDGER_LOCK is an RLock, so a caller that already
+        # holds it (delivery_snapshot does) re-enters harmlessly.
         with _LEDGER_LOCK:
-            callbacks = _load_ledger()
+            return _footprint_of(_load_ledger(), out)
+    return _footprint_of(callbacks, out)
+
+
+def _footprint_of(callbacks, out: dict[str, Any]) -> dict[str, Any]:
     callbacks = callbacks if isinstance(callbacks, dict) else {}
     signals = callbacks.get("signals") or {}
     event_ids = callbacks.get("event_ids") or {}
@@ -416,6 +443,19 @@ def _callback_position_rows(callbacks: dict):
 
 
 def delivery_snapshot(ledger: str = 'full') -> dict:
+    """The execution-truth snapshot, built with the ledger held still.
+
+    THE LOCK COVERS THE WHOLE BUILD, not just the read. It used to wrap only
+    `callbacks = _load_ledger()`, so every walk below ran while record_callback
+    was free to insert into the same dicts from another worker thread. CI caught
+    it as "dictionary changed size during iteration" on a run that was green on
+    my machine twenty minutes earlier.
+    """
+    with _LEDGER_LOCK:
+        return _delivery_snapshot_locked(ledger)
+
+
+def _delivery_snapshot_locked(ledger: str = 'full') -> dict:
     """The execution-truth snapshot. `ledger` decides how much of it travels.
 
     THREE MODES, because the three callers need genuinely different amounts:
@@ -463,8 +503,7 @@ def delivery_snapshot(ledger: str = 'full') -> dict:
     # raises "dictionary changed size during iteration". That hazard is
     # introduced by sharing one copy and is the price of not parsing; the work
     # under the lock is the same walk this function always did, minus the parse.
-    with _LEDGER_LOCK:
-        callbacks = _load_ledger()
+    callbacks = _load_ledger()
     signals = state.get("signals", {})
     callback_signals = callbacks.get("signals", {})
     rows = list(_callback_position_rows(callbacks))
@@ -561,7 +600,10 @@ def delivery_snapshot(ledger: str = 'full') -> dict:
         "unspecified_open_failure_event_count_max": max(unspecified_event_counts, default=0),
         "unspecified_open_failure_rows_with_events": sum(1 for n in unspecified_event_counts if n > 0),
         "signals": signals,
-        "callbacks": callback_signals,
+        # A live reference into the shared ledger, serialised by FastAPI after
+        # the lock is gone. 'full' is the detail read and is rarely called, so
+        # it pays for a private copy rather than racing the writer.
+        "callbacks": copy.deepcopy(callback_signals) if callback_signals else callback_signals,
     }
     if ledger == "none":
         out.pop("signals", None)
@@ -586,8 +628,13 @@ def delivery_snapshot(ledger: str = 'full') -> dict:
                 newest[market] = (sid, stamp)
         keep = {sid for sid, _ in newest.values()}
         out["signals"] = {k: v for k, v in (signals or {}).items() if k in keep}
-        out["callbacks"] = {k: v for k, v in (callback_signals or {}).items()
-                            if k in keep}
+        # COPIED, NOT REFERENCED. callback_signals points into the shared ledger,
+        # and FastAPI serialises this payload long after the lock is released --
+        # so handing out a live reference races exactly the way the unlocked walk
+        # did. `signals` above comes from the delivery file, which _read already
+        # returns as a private parse, so only this side needs it.
+        out["callbacks"] = copy.deepcopy(
+            {k: v for k, v in (callback_signals or {}).items() if k in keep})
         out["ledger_omitted"] = {
             "reason": "the dashboard only reads the newest signal per market and "
                       "its callback; the full ledger made this a 28MB body and the "

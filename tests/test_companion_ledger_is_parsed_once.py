@@ -260,21 +260,65 @@ class LedgerIsParsedOnce(unittest.TestCase):
         stop.set()
         self.assertEqual(errors, [])
 
-    def test_both_read_sites_take_the_lock(self):
-        """A race is probabilistic and a missing lock is not. The thread test
-        above is the smoke; this is the guard, and it is the one that stays
-        honest if the timing ever shifts."""
-        source = Path(th.__file__).read_text(encoding='utf-8')
-        for name in ('delivery_snapshot', 'ledger_footprint'):
-            start = source.index('def %s' % name)
-            end = source.index('\ndef ', start + 1)
-            body = source[start:end]
-            if '_load_ledger()' not in body:
-                continue
-            call = body.index('_load_ledger()')
-            preceding = body[:call]
-            self.assertIn('with _LEDGER_LOCK:', preceding,
-                          '%s reads the shared ledger without holding the lock' % name)
+    def test_touching_the_ledger_without_the_lock_fails_immediately(self):
+        """THE SOURCE GUARD BELOW WAS TOO WEAK AND CI PROVED IT.
+
+        delivery_snapshot held the lock across `callbacks = _load_ledger()` and
+        then walked the shared ledger outside it. The substring check passed --
+        `with _LEDGER_LOCK:` really did precede the call -- and the reader raised
+        "dictionary changed size during iteration" on the runner anyway, on a
+        commit that was green here twenty minutes earlier.
+
+        A race is timing. An assertion at the point of misuse is not. _load_ledger
+        now refuses to run unlocked, so the next person who reaches for the
+        ledger without the lock finds out in the first test they run rather than
+        once in a while in production.
+        """
+        with self.assertRaises(RuntimeError) as caught:
+            th._load_ledger()
+        self.assertIn('_LEDGER_LOCK', str(caught.exception))
+
+    def test_the_returned_ledger_is_a_copy_not_a_live_reference(self):
+        """FastAPI serialises the payload long after the lock is released, so a
+        live reference into the shared ledger races exactly the way the unlocked
+        walk did."""
+        th.record_callback(event(1, signal='BTC-1'))
+        # 'full', not 'latest': 'latest' keys off the markets in the DELIVERY
+        # file, which is empty in this fixture, so nothing travelled and the
+        # test skipped itself. A skipped test proves nothing.
+        # BOTH MODES THAT CARRY THE LEDGER, not just one. A mutation that made
+        # 'latest' hand out a live reference passed while only 'full' was
+        # checked, which is the same shape as the guard this file already
+        # deleted for being green on the bug.
+        #
+        # 'latest' keys off the markets in the DELIVERY file, so that has to
+        # exist or the mode returns nothing and the check is vacuous.
+        th._write(th._state_path(), {'signals': {'BTC-1': {
+            'market': 'BTC', 'signal_id': 'BTC-1',
+            'attempted_at': '2026-09-25T00:00:00+00:00'}}})
+        with th._LEDGER_LOCK:
+            live = th._load_ledger()['signals']
+        for mode in ('full', 'latest'):
+            returned = (th.delivery_snapshot(ledger=mode) or {}).get('callbacks') or {}
+            self.assertTrue(returned,
+                            'no callback signals travelled in %s, so nothing was '
+                            'checked' % mode)
+            for sid, row in returned.items():
+                self.assertIsNot(row, live.get(sid),
+                                 '%s handed out a live reference to %s' % (mode, sid))
+
+    # REMOVED: test_both_read_sites_take_the_lock.
+    #
+    # It asserted that `with _LEDGER_LOCK:` appeared somewhere before
+    # `_load_ledger()` in each reader. That was true while delivery_snapshot
+    # walked the shared ledger OUTSIDE the lock, so it passed on the exact
+    # commit CI failed, and after the fix it started failing on the wrapper's
+    # own docstring. A guard that is green on the bug and red on the fix is
+    # worse than no guard.
+    #
+    # test_touching_the_ledger_without_the_lock_fails_immediately replaces it
+    # and is strictly stronger: it checks the property at runtime, at the point
+    # of misuse, rather than looking for a string near a call.
 
 
 if __name__ == '__main__':
