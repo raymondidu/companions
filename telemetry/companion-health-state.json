@@ -1,5 +1,5 @@
 {
-  "captured_at_epoch": 1790712194.2994697,
+  "captured_at_epoch": 1790716932.4661837,
   "cleared_this_pass": [],
   "lifecycle": {
     "accepted": 168,
@@ -24,5 +24,5 @@
   },
   "open_faults": [],
   "opening_stall_intervals": 1,
-  "scans": 5355
+  "scans": 5427
 }
