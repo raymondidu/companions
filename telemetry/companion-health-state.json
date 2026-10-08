@@ -1,6 +1,8 @@
 {
-  "captured_at_epoch": 1791487834.5501275,
-  "cleared_this_pass": [],
+  "captured_at_epoch": 1791490112.764361,
+  "cleared_this_pass": [
+    "SCANS_NOT_ADVANCING"
+  ],
   "lifecycle": {
     "accepted": 349,
     "closed_positions": 69,
@@ -28,17 +30,10 @@
       "always_alarms": false,
       "code": "OPENING_STALLED",
       "detail": "delivery advanced over 4 consecutive readings while opened_signals stayed at 65",
-      "open_for_seconds": 19927.0,
+      "open_for_seconds": 22205.3,
       "since": 1791467907.5127952
-    },
-    {
-      "always_alarms": false,
-      "code": "SCANS_NOT_ADVANCING",
-      "detail": "scans stuck at 6 since the previous reading",
-      "open_for_seconds": 0.0,
-      "since": 1791487834.5501275
     }
   ],
   "opening_stall_intervals": 4,
-  "scans": 6
+  "scans": 7
 }
