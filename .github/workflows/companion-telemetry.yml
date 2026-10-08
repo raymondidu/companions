@@ -140,6 +140,7 @@ jobs:
                 'most_events_on_one_row': th.get('unspecified_open_failure_event_count_max'),
             })
 
+            market_rows = {}
             for key, market in sorted((health.get('markets') or {}).items()):
                 candidate = market.get('live_signal_candidate') or {}
                 delivery = market.get('tradehouse_delivery')
@@ -178,6 +179,54 @@ jobs:
                     row['error'] = market.get('error')
 
                 print(f'COMPANION_MARKET {key}', row)
+                market_rows[key] = row
 
+            # EVERY LINE ABOVE WAS ONLY EVER IN THE RUN LOG, WHICH IS NOT REACHABLE
+            # FROM EVERY CLIENT: the logs endpoint 302s to a blob host that some
+            # network policies refuse, and a failed step's auto-annotation carries
+            # only the exit code. So the one instrument that says whether USOIL and
+            # BTC are trading could be green, complete and still answer nobody.
+            #
+            # Check-run annotations are served by the API itself, so this makes the
+            # same payload readable without changing what is collected. ONE
+            # annotation, not one per section: GitHub serves at most 10 per step and
+            # drops the 11th in silence, so a per-market or per-section emission
+            # would spend the budget and lose whichever payload was added last.
+            #
+            # Names and numbers only. No secret, no host, no key.
+            def notice(title, payload):
+                body = json.dumps(payload, default=str, sort_keys=True)
+                escaped = (body.replace('%', '%25')
+                               .replace('\r', '%0D')
+                               .replace('\n', '%0A'))
+                print('::notice title=%s::%s' % (title, escaped[:3500]))
+
+            notice('COMPANION_STATE', {
+                'ok': health.get('ok'),
+                'deploy_sha': health.get('deploy_sha'),
+                'active_paths': th.get('active_paths'),
+                'cohort': th.get('cohort'),
+                'executor_configured': th.get('executor_configured'),
+                'callback_configured': th.get('callback_configured'),
+                'lifecycle': {
+                    'generated': summary.get('generated'),
+                    'sent': summary.get('sent'),
+                    'accepted': summary.get('accepted'),
+                    'opened_signals': summary.get('opened_signals'),
+                    'opened_positions': summary.get('opened_positions'),
+                    'closed_signals': summary.get('closed_signals'),
+                    'closed_positions': summary.get('closed_positions'),
+                    'open_failed_signals': summary.get('open_failed_signals'),
+                    'open_failed_positions': summary.get('open_failed_positions'),
+                },
+                'open_failure_reasons': reasons or 'NONE',
+                'markets': market_rows,
+                'reads': 'active_paths is the allowlist ACTUALLY in force, not what a '
+                         'README or dashboard label claims. live_gate per market is the '
+                         'answer to "why is nothing being sent for this market". '
+                         'generated != sent != accepted != opened: a drop between two '
+                         'of those names where the fault is, and open_failure_reasons '
+                         'names it when the drop is at the open.',
+            })
             print('COMPANION_TELEMETRY_COMPLETE')
             PY
