@@ -59,6 +59,10 @@ jobs:
           username: ${{ secrets.DO_USER }}
           key: ${{ secrets.DO_SSH_KEY }}
           port: 22
+          # EXPLICIT, because the health budget below is now ~480s and relying on
+          # the action's unstated default is how a slow boot gets cut off by a
+          # number nobody chose. The build plus the wait must both fit inside it.
+          command_timeout: 15m
           envs: COMPANION_EXECUTOR_SECRET,COMPANION_CALLBACK_SECRET
           script: |
             set -euo pipefail
@@ -94,14 +98,45 @@ jobs:
             docker compose up -d --build
             docker compose ps
 
+            # A GREEN DEPLOY THAT DID NOT DEPLOY AND A RED DEPLOY THAT DID ARE BOTH
+            # LIES, AND THIS STEP WAS TELLING THE SECOND ONE.
+            #
+            # 2026-10-08 19:24: both containers printed Created and Started, the box
+            # was serving normally 90 seconds later -- USOIL and BTC both RUNNING,
+            # heartbeats ~50s, ok true -- and this step went RED. 20 attempts at
+            # 5s timeout plus 3s sleep is 160 SECONDS of budget against a cold start
+            # that took about four minutes, so it gave up on a healthy box.
+            #
+            # Worse, the failure said nothing: the loop leaves HEALTH empty and the
+            # assertion below then parsed '' and died with
+            # `JSONDecodeError: Expecting value: line 1 column 1 (char 0)`. That
+            # cannot be told apart from a container that never started, which is the
+            # same fault the gold read-health watch paid for -- the error body is
+            # the answer and it was being thrown away.
+            #
+            # THE BUDGET IS RAISED AND THE COLD START IS MEASURED, not hidden. Four
+            # minutes to serve is itself worth knowing: it is an outage on every
+            # deploy and it will grow with the callback ledger. Widening the window
+            # without printing the number would bury exactly that.
             HEALTH=''
-            for attempt in $(seq 1 20); do
+            HEALTH_STARTED=$(date +%s)
+            HEALTH_ELAPSED=0
+            for attempt in $(seq 1 60); do
               HEALTH="$(curl --max-time 5 -fsS http://127.0.0.1:8082/health || true)"
+              HEALTH_ELAPSED=$(( $(date +%s) - HEALTH_STARTED ))
               if [ -n "$HEALTH" ] && printf '%s' "$HEALTH" | python3 -c 'import json,sys; d=json.load(sys.stdin); t=d.get("tradehouse") or {}; raise SystemExit(0 if t.get("executor_configured") is True and t.get("live_enable_requested") is True else 1)' 2>/dev/null; then
                 break
               fi
               sleep 3
             done
 
+            echo "COMPANION_TIME_TO_SERVE_SECONDS ${HEALTH_ELAPSED} (attempts up to 60, budget ~480s)"
+            if [ -z "$HEALTH" ]; then
+              echo "::error::The containers started but http://127.0.0.1:8082/health never answered within ${HEALTH_ELAPSED}s. This is NOT a parse failure and NOT proof the deploy did not happen -- check 'docker compose ps' above: if both containers read Started, the image is deployed and the app did not finish booting in time."
+              docker compose ps || true
+              docker compose logs --tail 40 companion-dashboard || true
+              exit 1
+            fi
+
             printf '%s' "$HEALTH" | python3 -c 'import json,sys; d=json.load(sys.stdin); t=d.get("tradehouse") or {}; assert t.get("executor_configured") is True,d; assert t.get("live_enable_requested") is True,d'
-            echo 'Companion deployment verified: TradeHouse transport configured, callback auth present, and pilot enabled.'
+            echo "Companion deployment verified in ${HEALTH_ELAPSED}s: TradeHouse transport configured, callback auth present, and pilot enabled."
