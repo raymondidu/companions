@@ -1,24 +1,24 @@
 {
-  "captured_at_epoch": 1791574934.7966404,
+  "captured_at_epoch": 1791588474.2724383,
   "cleared_this_pass": [],
   "lifecycle": {
-    "accepted": 357,
+    "accepted": 359,
     "closed_positions": 69,
     "closed_signals": 46,
-    "generated": 407,
-    "open_failed_positions": 5540,
-    "open_failed_signals": 269,
+    "generated": 409,
+    "open_failed_positions": 5586,
+    "open_failed_signals": 271,
     "opened_positions": 104,
     "opened_signals": 65,
-    "sent": 405
+    "sent": 407
   },
   "open_failure_reasons": {
-    "AWAITING_PRIOR_SUBMIT_FILL": 400,
+    "AWAITING_PRIOR_SUBMIT_FILL": 440,
     "BELOW_MIN_CAPITAL": 57,
     "BROKER_OPEN_FAILED": 4344,
     "COMPANION_INSUFFICIENT_CAPITAL_TO_STACK": 2,
     "INSTRUMENT_POSITION_OPEN": 1,
-    "INSUFFICIENT_FREE_MARGIN": 539,
+    "INSUFFICIENT_FREE_MARGIN": 545,
     "NO_BROKER": 1,
     "STALE_SIGNAL": 67,
     "UNSPECIFIED_OPEN_FAILURE": 129
@@ -26,12 +26,33 @@
   "open_faults": [
     {
       "always_alarms": false,
+      "code": "MARKET_NOT_RUNNING_SILVER",
+      "detail": "SILVER state is 'ERROR'",
+      "open_for_seconds": 0.0,
+      "since": 1791588474.2724383
+    },
+    {
+      "always_alarms": false,
+      "code": "MARKET_NOT_RUNNING_USOIL",
+      "detail": "USOIL state is 'ERROR'",
+      "open_for_seconds": 0.0,
+      "since": 1791588474.2724383
+    },
+    {
+      "always_alarms": false,
       "code": "OPENING_STALLED",
-      "detail": "delivery advanced over 6 consecutive readings while opened_signals stayed at 65",
-      "open_for_seconds": 107027.3,
+      "detail": "delivery advanced over 7 consecutive readings while opened_signals stayed at 65",
+      "open_for_seconds": 120566.8,
       "since": 1791467907.5127952
+    },
+    {
+      "always_alarms": true,
+      "code": "SILVER_NOT_REFUSED",
+      "detail": "SILVER gate is None, must be REFUSED_INSTRUMENT",
+      "open_for_seconds": 0.0,
+      "since": 1791588474.2724383
     }
   ],
-  "opening_stall_intervals": 6,
-  "scans": 1297
+  "opening_stall_intervals": 7,
+  "scans": 1504
 }
