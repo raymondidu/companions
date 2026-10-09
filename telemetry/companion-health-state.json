@@ -1,5 +1,5 @@
 {
-  "captured_at_epoch": 1791588474.2724383,
+  "captured_at_epoch": 1791588956.6907325,
   "cleared_this_pass": [],
   "lifecycle": {
     "accepted": 359,
@@ -28,31 +28,31 @@
       "always_alarms": false,
       "code": "MARKET_NOT_RUNNING_SILVER",
       "detail": "SILVER state is 'ERROR'",
-      "open_for_seconds": 0.0,
+      "open_for_seconds": 482.4,
       "since": 1791588474.2724383
     },
     {
       "always_alarms": false,
       "code": "MARKET_NOT_RUNNING_USOIL",
       "detail": "USOIL state is 'ERROR'",
-      "open_for_seconds": 0.0,
+      "open_for_seconds": 482.4,
       "since": 1791588474.2724383
     },
     {
       "always_alarms": false,
       "code": "OPENING_STALLED",
       "detail": "delivery advanced over 7 consecutive readings while opened_signals stayed at 65",
-      "open_for_seconds": 120566.8,
+      "open_for_seconds": 121049.2,
       "since": 1791467907.5127952
     },
     {
       "always_alarms": true,
       "code": "SILVER_NOT_REFUSED",
       "detail": "SILVER gate is None, must be REFUSED_INSTRUMENT",
-      "open_for_seconds": 0.0,
+      "open_for_seconds": 482.4,
       "since": 1791588474.2724383
     }
   ],
   "opening_stall_intervals": 7,
-  "scans": 1504
+  "scans": 1511
 }
