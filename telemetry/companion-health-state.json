@@ -1,10 +1,6 @@
 {
-  "captured_at_epoch": 1791600028.432276,
-  "cleared_this_pass": [
-    "MARKET_NOT_RUNNING_SILVER",
-    "MARKET_NOT_RUNNING_USOIL",
-    "SILVER_NOT_REFUSED"
-  ],
+  "captured_at_epoch": 1791600573.60949,
+  "cleared_this_pass": [],
   "lifecycle": {
     "accepted": 359,
     "closed_positions": 69,
@@ -32,10 +28,10 @@
       "always_alarms": false,
       "code": "OPENING_STALLED",
       "detail": "delivery advanced over 7 consecutive readings while opened_signals stayed at 65",
-      "open_for_seconds": 132120.9,
+      "open_for_seconds": 132666.1,
       "since": 1791467907.5127952
     }
   ],
   "opening_stall_intervals": 7,
-  "scans": 1682
+  "scans": 1690
 }
