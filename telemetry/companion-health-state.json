@@ -1,5 +1,5 @@
 {
-  "captured_at_epoch": 1792187277.8914733,
+  "captured_at_epoch": 1792194762.5651114,
   "cleared_this_pass": [],
   "lifecycle": {
     "accepted": 465,
@@ -23,7 +23,29 @@
     "STALE_SIGNAL": 67,
     "UNSPECIFIED_OPEN_FAILURE": 129
   },
-  "open_faults": [],
+  "open_faults": [
+    {
+      "always_alarms": false,
+      "code": "MARKET_NOT_RUNNING_SILVER",
+      "detail": "SILVER state is 'ERROR'",
+      "open_for_seconds": 0.0,
+      "since": 1792194762.5651114
+    },
+    {
+      "always_alarms": false,
+      "code": "MARKET_NOT_RUNNING_USOIL",
+      "detail": "USOIL state is 'ERROR'",
+      "open_for_seconds": 0.0,
+      "since": 1792194762.5651114
+    },
+    {
+      "always_alarms": true,
+      "code": "SILVER_NOT_REFUSED",
+      "detail": "SILVER gate is None, must be REFUSED_INSTRUMENT",
+      "open_for_seconds": 0.0,
+      "since": 1792194762.5651114
+    }
+  ],
   "opening_stall_intervals": 0,
-  "scans": 10599
+  "scans": 10713
 }
