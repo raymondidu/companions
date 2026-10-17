@@ -1,10 +1,6 @@
 {
-  "captured_at_epoch": 1792210321.4938977,
-  "cleared_this_pass": [
-    "MARKET_NOT_RUNNING_SILVER",
-    "MARKET_NOT_RUNNING_USOIL",
-    "SILVER_NOT_REFUSED"
-  ],
+  "captured_at_epoch": 1792210421.64132,
+  "cleared_this_pass": [],
   "lifecycle": {
     "accepted": 471,
     "closed_positions": 97,
@@ -29,5 +25,5 @@
   },
   "open_faults": [],
   "opening_stall_intervals": 1,
-  "scans": 10951
+  "scans": 10953
 }
