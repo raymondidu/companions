@@ -1,10 +1,10 @@
 {
-  "captured_at_epoch": 1793125502.5439389,
+  "captured_at_epoch": 1793140500.3941672,
   "cleared_this_pass": [],
   "lifecycle": {
     "accepted": 666,
-    "closed_positions": 176,
-    "closed_signals": 146,
+    "closed_positions": 177,
+    "closed_signals": 147,
     "generated": 733,
     "open_failed_positions": 12563,
     "open_failed_signals": 578,
@@ -25,5 +25,5 @@
   },
   "open_faults": [],
   "opening_stall_intervals": 0,
-  "scans": 24681
+  "scans": 24908
 }
