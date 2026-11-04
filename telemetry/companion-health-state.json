@@ -1,29 +1,29 @@
 {
-  "captured_at_epoch": 1793760538.109743,
+  "captured_at_epoch": 1793761897.8172002,
   "cleared_this_pass": [],
   "lifecycle": {
-    "accepted": 787,
+    "accepted": 788,
     "closed_positions": 241,
     "closed_signals": 192,
-    "generated": 854,
-    "open_failed_positions": 15299,
-    "open_failed_signals": 694,
+    "generated": 855,
+    "open_failed_positions": 15342,
+    "open_failed_signals": 695,
     "opened_positions": 282,
     "opened_signals": 218,
-    "sent": 852
+    "sent": 853
   },
   "open_failure_reasons": {
-    "AWAITING_PRIOR_SUBMIT_FILL": 9440,
+    "AWAITING_PRIOR_SUBMIT_FILL": 9481,
     "BELOW_MIN_CAPITAL": 57,
     "BROKER_OPEN_FAILED": 4344,
     "COMPANION_INSUFFICIENT_CAPITAL_TO_STACK": 2,
     "INSTRUMENT_POSITION_OPEN": 1,
-    "INSUFFICIENT_FREE_MARGIN": 1258,
+    "INSUFFICIENT_FREE_MARGIN": 1260,
     "NO_BROKER": 1,
     "STALE_SIGNAL": 67,
     "UNSPECIFIED_OPEN_FAILURE": 129
   },
   "open_faults": [],
-  "opening_stall_intervals": 0,
-  "scans": 33908
+  "opening_stall_intervals": 1,
+  "scans": 33928
 }
