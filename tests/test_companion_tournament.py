@@ -145,7 +145,7 @@ def test_v2_rejects_fresh_reversal_even_when_ema_structure_still_lags():
     assert reason=='V2_HTF_MOMENTUM_OPPOSES_STRUCTURE'
 
 
-def test_transferred_gold_and_crypto_lanes_can_admit_clean_forward_setup():
+def test_transferred_gold_and_crypto_lanes_reject_entry_at_resistance():
     def wave(step,amplitude):
         rows=[]
         for i in range(120):
@@ -157,11 +157,11 @@ def test_transferred_gold_and_crypto_lanes_can_admit_clean_forward_setup():
     m15=wave(.03,.20);h1=wave(.10,.20);h4=wave(.18,.20);bid=float(m15.iloc[-1].close);ask=bid+.01
     gold=next(p for p in PROFILES if p.key=='GOLD_HTF_PRECISION')
     crypto=next(p for p in PROFILES if p.key=='CRYPTO_CLEAN_PATH_10X_STOP6')
-    gold_signal,_=evaluate_profile(MARKETS['SILVER'],gold,m15,h1,h4,bid,ask)
-    crypto_signal,_=evaluate_profile(MARKETS['BTC'],crypto,m15,h1,h4,bid,ask,{'crypto_breadth':{'state':'LONG_FAVORED','long_allowed':True,'short_allowed':False,'pressure_score':30}})
-    assert gold_signal is not None
-    assert crypto_signal is not None
-    assert gold_signal.direction==crypto_signal.direction=='LONG'
+    gold_signal,gold_reason=evaluate_profile(MARKETS['SILVER'],gold,m15,h1,h4,bid,ask)
+    crypto_signal,crypto_reason=evaluate_profile(MARKETS['BTC'],crypto,m15,h1,h4,bid,ask,{'crypto_breadth':{'state':'LONG_FAVORED','long_allowed':True,'short_allowed':False,'pressure_score':30}})
+    assert gold_signal is None
+    assert crypto_signal is None
+    assert gold_reason == crypto_reason == 'BUY_INTO_RESISTANCE'
 
 
 def test_scanner_writes_running_heartbeat(tmp_path):
