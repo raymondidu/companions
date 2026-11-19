@@ -27,7 +27,7 @@ class CompanionMarket:
 MARKETS: dict[str, CompanionMarket] = {
     "SILVER": CompanionMarket(
         key="SILVER", display_name="Silver Intelligence Lab", broker_symbol="XAGUSD",
-        provider_symbol="XAG_USD", asset_class="METAL", enabled_for_paper=True,
+        provider_symbol="XAG_USD", asset_class="METAL", enabled_for_paper=False,
         liquidity_approved=True,
         liquidity_basis="CME silver complex has persistent high daily notional and contract volume",
         first_trigger_atr=1.25, first_lock_atr=0.60, step_atr=0.50,
