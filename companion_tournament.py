@@ -224,7 +224,7 @@ def _prediction_v2_candidate(market,profile,a15,a1,a4,bid,ask,context):
     return _signal(market,profile,direction,score,'CONFIRMED_TREND',atr,bid,ask,reasons),'ACCEPTED'
 
 
-def evaluate_profile(market: CompanionMarket, profile: EntryProfile, m15: pd.DataFrame, h1: pd.DataFrame, h4: pd.DataFrame, bid: float, ask: float, context: dict | None = None):
+def _evaluate_profile_unchecked(market: CompanionMarket, profile: EntryProfile, m15: pd.DataFrame, h1: pd.DataFrame, h4: pd.DataFrame, bid: float, ask: float, context: dict | None = None):
     if min(len(m15),len(h1),len(h4)) < 60:
         return None,'INSUFFICIENT_HISTORY'
     if profile.asset_classes and market.asset_class not in profile.asset_classes:
@@ -270,6 +270,32 @@ def evaluate_profile(market: CompanionMarket, profile: EntryProfile, m15: pd.Dat
         return None,'SETUP_OR_SCORE_BELOW_PROFILE_FLOOR'
     ref=float(ask if direction=='LONG' else bid)
     return CompanionSignal(market.key,market.broker_symbol,direction,min(score,100),setup,ref,atr,pd.Timestamp.utcnow().isoformat(),tuple(reasons)),'ACCEPTED'
+
+
+def evaluate_profile(market, profile, m15, h1, h4, bid, ask, context=None):
+    candidate, reason = _evaluate_profile_unchecked(market, profile, m15, h1, h4, bid, ask, context)
+    if candidate is None:
+        return None, reason
+    from math import isfinite
+    try:
+        entry = float(candidate.reference_price)
+        atr = float(candidate.entry_atr)
+        spread = float(ask) - float(bid)
+        if not all(isfinite(v) for v in (entry, atr, spread)) or entry <= 0 or atr <= 0 or spread < 0:
+            raise ValueError('invalid price')
+        buffer = max(0.25 * atr, spread)
+        column = 'low' if candidate.direction == 'SHORT' else 'high'
+        for frame, lookback in ((m15, 20), (h1, 24), (h4, 12)):
+            values = frame[column].iloc[-lookback-1:-1]
+            if len(values) != lookback or not all(isfinite(float(v)) and float(v) > 0 for v in values):
+                raise ValueError('invalid levels')
+            level = float(values.min() if column == 'low' else values.max())
+            distance = entry - level if column == 'low' else level - entry
+            if -buffer <= distance <= buffer:
+                return None, 'SELL_INTO_SUPPORT' if column == 'low' else 'BUY_INTO_RESISTANCE'
+    except (AttributeError, KeyError, TypeError, ValueError, OverflowError):
+        return None, 'SUPPORT_RESISTANCE_DATA_INVALID'
+    return candidate, reason
 
 
 def candidate_for_profile(market: CompanionMarket, profile: EntryProfile, m15: pd.DataFrame, h1: pd.DataFrame, h4: pd.DataFrame, bid: float, ask: float, context: dict | None = None) -> CompanionSignal | None:
@@ -333,3 +359,4 @@ class Tournament:
             policy=s.get('research_policy') or {}
             rows.append({'profile':key,'family':s.get('family'),'execution_model':policy.get('execution_model'),'paper_trade_usd':policy.get('paper_trade_usd'),'paper_lot_size':policy.get('paper_lot_size'),'sizing_basis':policy.get('sizing_basis'),'starting_equity_usd':policy.get('starting_equity_usd'),'cohort':policy.get('cohort'),'leverage':policy.get('leverage'),'last_decision':s.get('last_decision'),'opened':opened,'closed':closed,'open_pnl_usd':s.get('open_pnl_usd',0),'realized_pnl_usd':round(realized_pnl,2),'first_locks':locks,'first_lock_rate_pct':round(lock_rate,2),'true_confidence_rate_pct':s.get('true_confidence_rate_pct',0),'realized_capital_return_sum_pct':round(realized,4),'worst_adverse_atr':round(worst,3),'worst_adverse_capital_pct':s.get('worst_adverse_capital_pct',0),'evidence_weight':round(evidence,3),'research_score':round(quality*evidence,3),'rank_eligible':closed>=30,'promotion_ready': closed>=200 and lock_rate>=80 and worst<=2.0})
         return sorted(rows,key=lambda x:(x['promotion_ready'],x['research_score'],x['first_lock_rate_pct']),reverse=True)
+
