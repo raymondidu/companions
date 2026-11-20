@@ -8,6 +8,7 @@ import hmac
 import ijson
 import json
 import os
+import sys
 import threading
 import time
 from datetime import datetime, timezone
@@ -106,11 +107,21 @@ def _callback_path() -> Path:
     return _data_dir() / "tradehouse_callbacks.json"
 
 
+class _SharedKeysDict(dict):
+    """Share repeated JSON field names across the streamed callback history."""
+    def __setitem__(self, key, value):
+        super().__setitem__(sys.intern(key), value)
+
+
+def shared_json_keys(value: dict) -> dict:
+    return {sys.intern(key): item for key, item in value.items()}
+
+
 def _read(path: Path) -> dict:
     try:
         if path.exists():
             with path.open('rb') as handle:
-                value = next(ijson.items(handle, '', use_float=True))
+                value = next(ijson.items(handle, '', use_float=True, map_type=_SharedKeysDict))
             return value if isinstance(value, dict) else {}
     except Exception:
         if path == _callback_path():
@@ -226,7 +237,7 @@ def _replay_wal_lines(state: dict, handle) -> int:
             if not line:
                 continue
             try:
-                row = json.loads(line)
+                row = json.loads(line, object_hook=shared_json_keys)
             except Exception:
                 continue
             if not isinstance(row, dict):

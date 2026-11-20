@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
 from companion_markets import MARKETS, isolation_contract
-from companion_tradehouse import delivery_snapshot, record_callback_async, verify_callback_signature
+from companion_tradehouse import delivery_snapshot, record_callback_async, verify_callback_signature, shared_json_keys
 
 DATA_DIR=Path(os.getenv('COMPANION_DATA_DIR','/app/companion-data'))
 app=FastAPI(title='Isolated Companion Markets Research')
@@ -61,7 +61,7 @@ async def tradehouse_callback(request: Request):
     if not verify_callback_signature(body,request.headers):
         raise HTTPException(status_code=401,detail='UNAUTHORIZED_CALLBACK')
     try:
-        payload=json.loads(body.decode('utf-8'))
+        payload=json.loads(body.decode('utf-8'), object_hook=shared_json_keys)
     except Exception:
         raise HTTPException(status_code=400,detail='INVALID_JSON')
     # AWAITED, NOT CALLED. record_callback rewrites a 34.5 MB ledger; running it

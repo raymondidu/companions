@@ -28,6 +28,15 @@ def test_latest_summary_does_not_copy_event_history():
     assert 'events' not in out['positions']['p']
 
 
+def test_streamed_history_shares_repeated_field_names(tmp_path):
+    path = tmp_path / 'ledger.json'
+    th._write(path, {'rows': [{'a_repeated_callback_field': 1}, {'a_repeated_callback_field': 2}]})
+    first, second = th._read(path)['rows']
+    assert next(iter(first)) is next(iter(second))
+    assert first['a_repeated_callback_field'] == 1
+    assert second['a_repeated_callback_field'] == 2
+
+
 def test_large_snapshot_roundtrip_uses_streams(tmp_path):
     path = tmp_path / 'ledger.json'
     value = {'signals': {str(i): {'events': {'e': {'message': '£ Ω ' * 1000,
