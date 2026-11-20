@@ -37,6 +37,21 @@ def test_streamed_history_shares_repeated_field_names(tmp_path):
     assert second['a_repeated_callback_field'] == 2
 
 
+def test_callback_checkpoint_encodes_events_without_encoding_whole_history(tmp_path, monkeypatch):
+    path = tmp_path / 'tradehouse_callbacks.json'
+    monkeypatch.setattr(th, '_callback_path', lambda: path)
+    value = {'event_ids': {'e': {'signal_id': 's'}}, 'signals': {'s': {'positions': {
+        'p': {'last_event': 'OPENED', 'events': {'e': {'price': 12.5, 'reason': '£ Ω',
+            'nested': {'flags': [True, None, 3]}}}}}}}}
+    original = json.dumps
+    def bounded(item, *args, **kwargs):
+        assert item is not value, 'entire history was encoded in memory'
+        return original(item, *args, **kwargs)
+    with patch.object(json, 'dumps', side_effect=bounded):
+        th._write(path, value)
+    assert th._read(path) == value
+
+
 def test_large_snapshot_roundtrip_uses_streams(tmp_path):
     path = tmp_path / 'ledger.json'
     value = {'signals': {str(i): {'events': {'e': {'message': '£ Ω ' * 1000,

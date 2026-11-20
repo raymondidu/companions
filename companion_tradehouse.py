@@ -132,13 +132,31 @@ def _read(path: Path) -> dict:
     return {}
 
 
+def _write_callback_object(handle, value: dict, event_values: bool = False) -> None:
+    """Stream containers, using the C encoder for one event at a time."""
+    handle.write('{')
+    for index, key in enumerate(sorted(value)):
+        if index:
+            handle.write(', ')
+        handle.write(json.dumps(key) + ': ')
+        item = value[key]
+        if isinstance(item, dict) and not event_values:
+            _write_callback_object(handle, item, key in {'events', 'event_ids'})
+        else:
+            handle.write(json.dumps(item, sort_keys=True, default=str))
+    handle.write('}')
+
+
 def _write(path: Path, value: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     # Stream encoding: a full dumps() plus UTF-8 encoding held two extra
     # copies of the 599 MB callback ledger and caused repeated OOM kills.
     with tmp.open("w", encoding="utf-8") as handle:
-        json.dump(value, handle, sort_keys=True, default=str)
+        if path == _callback_path():
+            _write_callback_object(handle, value)
+        else:
+            json.dump(value, handle, sort_keys=True, default=str)
     tmp.replace(path)
 
 
@@ -182,8 +200,10 @@ def _write(path: Path, value: dict) -> None:
 # mutates it raises "dictionary changed size during iteration". Every access
 # goes through _LEDGER_LOCK. The reader's work under it is the snapshot build,
 # which is the same walk it always did, minus the 40 MB parse.
-_LEDGER_FLUSH_SECONDS = 20.0
-_LEDGER_FLUSH_EVENTS = 50
+# Every accepted event is also appended to the replayable WAL. Snapshotting the
+# 599 MB history every 20 seconds kept the read lock occupied almost constantly.
+_LEDGER_FLUSH_SECONDS = 300.0
+_LEDGER_FLUSH_EVENTS = 500
 
 _LEDGER_LOCK = threading.RLock()
 _LEDGER: dict[str, Any] = {
@@ -321,7 +341,7 @@ def _flush_ledger(force: bool = False) -> bool:
         return False
     _LEDGER["fingerprint"] = _fingerprint(_callback_path())
     _LEDGER["dirty"] = 0
-    _LEDGER["flushed_at"] = now
+    _LEDGER["flushed_at"] = time.monotonic()
     try:
         _wal_path().unlink()
     except OSError:
