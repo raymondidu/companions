@@ -457,6 +457,18 @@ def _callback_position_rows(callbacks: dict):
             yield signal_id, str(signal.get("tradehouse_id") or signal_id), signal
 
 
+def _callback_summary(signal: dict) -> dict:
+    # The dashboard displays lifecycle fields, not the historical event bodies.
+    # Keep those bodies in the durable ledger and the explicit detail endpoint.
+    out = {k: copy.deepcopy(v) for k, v in signal.items() if k not in {'positions', 'events'}}
+    out['positions'] = {}
+    for key, position in (signal.get('positions') or {}).items():
+        out['positions'][key] = {k: copy.deepcopy(v) for k, v in position.items() if k != 'events'}
+        out['positions'][key]['event_count'] = len(position.get('events') or {})
+    out['event_history_omitted'] = True
+    return out
+
+
 def delivery_snapshot(ledger: str = 'full') -> dict:
     """The execution-truth snapshot, built with the ledger held still.
 
@@ -618,7 +630,7 @@ def _delivery_snapshot_locked(ledger: str = 'full') -> dict:
         # A live reference into the shared ledger, serialised by FastAPI after
         # the lock is gone. 'full' is the detail read and is rarely called, so
         # it pays for a private copy rather than racing the writer.
-        "callbacks": copy.deepcopy(callback_signals) if callback_signals else callback_signals,
+        "callbacks": copy.deepcopy(callback_signals) if ledger == 'full' else {},
     }
     if ledger == "none":
         out.pop("signals", None)
@@ -648,8 +660,8 @@ def _delivery_snapshot_locked(ledger: str = 'full') -> dict:
         # so handing out a live reference races exactly the way the unlocked walk
         # did. `signals` above comes from the delivery file, which _read already
         # returns as a private parse, so only this side needs it.
-        out["callbacks"] = copy.deepcopy(
-            {k: v for k, v in (callback_signals or {}).items() if k in keep})
+        out["callbacks"] = {
+            k: _callback_summary(v) for k, v in (callback_signals or {}).items() if k in keep}
         out["ledger_omitted"] = {
             "reason": "the dashboard only reads the newest signal per market and "
                       "its callback; the full ledger made this a 28MB body and the "

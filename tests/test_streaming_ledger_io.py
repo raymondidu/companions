@@ -5,6 +5,19 @@ from unittest.mock import patch
 import companion_tradehouse as th
 
 
+def test_latest_summary_does_not_copy_event_history():
+    class History(dict):
+        def __deepcopy__(self, memo):
+            raise AssertionError('copied historical event bodies')
+    signal = {'last_event': 'OPENED', 'positions': {'p': {
+        'broker_position_id': 'broker-1', 'events': History({'event-1': {'large': 'payload'}})}}}
+    out = th._callback_summary(signal)
+    assert out['last_event'] == 'OPENED'
+    assert out['positions']['p']['event_count'] == 1
+    assert out['positions']['p']['broker_position_id'] == 'broker-1'
+    assert 'events' not in out['positions']['p']
+
+
 def test_large_snapshot_roundtrip_uses_streams(tmp_path):
     path = tmp_path / 'ledger.json'
     value = {'signals': {str(i): {'events': {'e': {'message': '£ Ω ' * 1000,

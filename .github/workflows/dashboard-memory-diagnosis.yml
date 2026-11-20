@@ -3,6 +3,9 @@ on:
   push:
     paths: ['.github/workflows/dashboard-memory-diagnosis.yml']
   workflow_dispatch:
+  workflow_run:
+    workflows: ['Deploy to DigitalOcean']
+    types: [completed]
 permissions:
   contents: read
 jobs:
@@ -24,3 +27,28 @@ jobs:
             cat /proc/$pid/limits | head -12
             timeout 25 docker exec companions-companion-scanner-1 python -c 'import pathlib; print("DATA_FILE_BYTES"); [print(p.name,p.stat().st_size) for p in pathlib.Path("/app/companion-data").iterdir() if p.is_file()]'
             timeout 20 docker logs --since 15m companions-companion-dashboard-1 2>&1 | grep -E 'File "/app/|Error:|MemoryError|Too many open files' | tail -45 || true
+            python3 - <<'PYVERIFY'
+            import json, time, urllib.request
+            base = 'https://companion.tradehouseapp.com'
+            failed = []
+            for path in ["/health","/api/markets"]:
+                for attempt in range(3):
+                    try:
+                        with urllib.request.urlopen(base + path, timeout=20) as response:
+                            data = json.load(response)
+                            if data.get('degraded') or data.get('read_unavailable'):
+                                raise RuntimeError('degraded response')
+                            print('PUBLIC_READ', path, 'HTTP', response.status, 'build', data.get('build', data.get('version')), 'sha', data.get('deploy_sha'), 'ok', data.get('ok'), flush=True)
+                            if 'tradehouse' in data:
+                                print('LEDGER_FOOTPRINT', json.dumps(data['tradehouse'].get('ledger_footprint', {})), flush=True)
+                            if 'markets' in data:
+                                print('MARKET_STATES', {k:v.get('state') for k,v in data['markets'].items()}, flush=True)
+                            break
+                    except Exception as exc:
+                        print('PUBLIC_READ_RETRY', path, type(exc).__name__, str(exc)[:120], flush=True)
+                        if attempt == 2:
+                            failed.append(path)
+                        else:
+                            time.sleep(3)
+            raise SystemExit(bool(failed))
+            PYVERIFY
