@@ -113,6 +113,10 @@ def _read(path: Path) -> dict:
                 value = next(ijson.items(handle, '', use_float=True))
             return value if isinstance(value, dict) else {}
     except Exception:
+        if path == _callback_path():
+            # A failed parse must never become an empty ledger that the next
+            # callback overwrites. Leave the original file untouched and retry.
+            raise
         pass
     return {}
 

@@ -1,8 +1,18 @@
 import json
+import pytest
 from pathlib import Path
 from unittest.mock import patch
 
 import companion_tradehouse as th
+
+
+def test_unreadable_callback_history_is_not_replaced_with_empty_state(tmp_path, monkeypatch):
+    path = tmp_path / 'tradehouse_callbacks.json'
+    path.write_text('{"signals":')
+    monkeypatch.setattr(th, '_callback_path', lambda: path)
+    with pytest.raises(Exception):
+        th._read(path)
+    assert path.read_text() == '{"signals":'
 
 
 def test_latest_summary_does_not_copy_event_history():
