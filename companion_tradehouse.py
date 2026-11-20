@@ -5,6 +5,7 @@ import atexit
 import copy
 import hashlib
 import hmac
+import ijson
 import json
 import os
 import threading
@@ -108,7 +109,8 @@ def _callback_path() -> Path:
 def _read(path: Path) -> dict:
     try:
         if path.exists():
-            value = json.loads(path.read_text())
+            with path.open('rb') as handle:
+                value = next(ijson.items(handle, '', use_float=True))
             return value if isinstance(value, dict) else {}
     except Exception:
         pass
@@ -118,7 +120,10 @@ def _read(path: Path) -> dict:
 def _write(path: Path, value: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(value, sort_keys=True, default=str))
+    # Stream encoding: a full dumps() plus UTF-8 encoding held two extra
+    # copies of the 599 MB callback ledger and caused repeated OOM kills.
+    with tmp.open("w", encoding="utf-8") as handle:
+        json.dump(value, handle, sort_keys=True, default=str)
     tmp.replace(path)
 
 
@@ -202,7 +207,17 @@ def _replay_wal(state: dict) -> int:
     replayed = 0
     seen = state.setdefault("event_ids", {})
     try:
-        for line in path.read_text(encoding="utf-8").splitlines():
+        with path.open("r", encoding="utf-8") as handle:
+            return _replay_wal_lines(state, handle)
+    except OSError:
+        return 0
+
+
+def _replay_wal_lines(state: dict, handle) -> int:
+    replayed = 0
+    seen = state.setdefault("event_ids", {})
+    try:
+        for line in handle:
             line = line.strip()
             if not line:
                 continue
@@ -1029,3 +1044,4 @@ async def record_callback_async(payload: dict) -> tuple[bool, str]:
     """record_callback, off the event loop and still strictly serialised."""
     async with _CALLBACK_RECORD_LOCK:
         return await asyncio.to_thread(record_callback, payload)
+
