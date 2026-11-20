@@ -1,0 +1,26 @@
+name: Dashboard Memory Diagnosis
+on:
+  push:
+    paths: ['.github/workflows/dashboard-memory-diagnosis.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.DO_HOST }}
+          username: ${{ secrets.DO_USER }}
+          key: ${{ secrets.DO_SSH_KEY }}
+          command_timeout: 4m
+          script: |
+            set -u
+            docker stats --no-stream --format '{{.Name}} {{.MemUsage}} {{.CPUPerc}}'
+            pid=$(docker inspect -f '{{.State.Pid}}' companions-companion-dashboard-1)
+            echo "DASHBOARD_FD_COUNT $(ls /proc/$pid/fd 2>/dev/null | wc -l)"
+            cat /proc/$pid/limits | head -12
+            timeout 25 docker exec companions-companion-scanner-1 python -c 'import pathlib; print("DATA_FILE_BYTES"); [print(p.name,p.stat().st_size) for p in pathlib.Path("/app/companion-data").iterdir() if p.is_file()]'
+            timeout 20 docker logs --since 15m companions-companion-dashboard-1 2>&1 | grep -E 'File "/app/|Error:|MemoryError|Too many open files' | tail -45 || true
