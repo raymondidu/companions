@@ -21,8 +21,12 @@ jobs:
           command_timeout: 4m
           script: |
             set -u
-            docker stats --no-stream --format '{{.Name}} {{.MemUsage}} {{.CPUPerc}}'
-            pid=$(docker inspect -f '{{.State.Pid}}' companions-companion-dashboard-1)
+            echo HOST_MEMORY
+            free -m
+            df -h /
+            ps -eo pid,ppid,rss,comm --sort=-rss | head -12
+            timeout 15 docker stats --no-stream --format '{{.Name}} {{.MemUsage}} {{.CPUPerc}}'
+            pid=$(timeout 15 docker inspect -f '{{.State.Pid}}' companions-companion-dashboard-1)
             echo "DASHBOARD_FD_COUNT $(ls /proc/$pid/fd 2>/dev/null | wc -l)"
             cat /proc/$pid/limits | head -12
             timeout 25 docker exec companions-companion-scanner-1 python -c 'import pathlib; print("DATA_FILE_BYTES"); [print(p.name,p.stat().st_size) for p in pathlib.Path("/app/companion-data").iterdir() if p.is_file()]'
